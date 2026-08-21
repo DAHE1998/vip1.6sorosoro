@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+output/
+input/
+*.cubin
+*.o
+*.so
+*.a
+*.log
+.DS_Store

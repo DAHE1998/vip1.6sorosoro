@@ -1,0 +1,19 @@
+任务：识别block边界（把连续 scene 合并成 block）。
+
+判断依据：
+[P0]独立叙事：不包含两件及以上可单独讲述的事件，如探店，采访某一对象。
+[P1]在哪里（ASR中提到的地点名称）
+[P2]谁在画面里（句子人物标记）
+
+粒度要求（重要，优先遵守）：
+- 连续边界=error（不要出现相邻 scene 编号都当边界，如 78,79,80）
+- 单 scene block=error；单个无台词 scene 必须并入前一个block
+- if距离靠近且有台词的scene之间夹杂了无对话镜头，无对话镜头属于前一block，如：1[有]+2[无]+3[有]则={[1+2]+[3]}
+
+硬性约束：
+- 边界只能插在 scene 与 scene 之间，scene 内部不拆分
+- 切点应该落在scene的尾部而不是开头
+- 输出的编号是新 block 起始的 scene 编号，必须在 0 到 {n_max}（共 {n} 个 scene）
+
+输出要求：仅输出JSON：
+{{"boundaries": [sceneid1, sceneid2, sceneid3, ...]}}
