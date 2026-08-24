@@ -2,8 +2,8 @@
 """vlm/fuse_segments.py — 融合脚本（vlm 三件事之二：1.选帧 2.融合 3.送检）：自包含版
 （2026-08-18 大名），读选帧骨架段划分把每段帧拼成一张段图，全 GPU 不二次计算。
 
-用法（amaterasu env）: python vlm/fuse_segments.py vivant [--ep EP01]
-依赖: output/<项目>/vlm/*_skeleton.json（选帧骨架）、preproc/frames/<prefix>_f<fn>.jpg、
+用法（sorosoro env）: python vlm/fuse_segments.py vivant [--ep EP01]
+依赖: output/<项目>/vlm/*_skeleton.json（选帧骨架）、shikomi/frames/<prefix>_f<fn>.jpg、
       visual/dino/<prefix>_skeleton.json + npz、visual/face_head_fusion/sweep_records、
       visual/body_detect/body_bbox.json、audio/dialogue/<hash>_dialogue.json
 产物: output/<项目>/vlm/segments/（段图 {seg}.jpg + 验收页）、
@@ -21,7 +21,7 @@
        （audio，台词判定）——全部只读，不重检测
 
   融合逻辑（build_ribbon，与 novelize.py 定稿逐字一致）：读骨架 segments → 帧号 →
-  preproc/frames → build_ribbon（RIB_CFG 定稿，零改动）。像素计算全部 torch GPU：
+  shikomi/frames → build_ribbon（RIB_CFG 定稿，零改动）。像素计算全部 torch GPU：
   importance（阶段1 GPU 批量预算一次搬显存）/ compress_cold（列重采样）/ rasterize（画布
   拼接）/ 锁列 mask / face 保护 mask / DINO cos。无任何 CPU 兜底（CUDA 不可用直接报错，
   禁 try/except 回退）。阶段2 串行（禁止多进程 fork 大缓存——2026-08-17 假死教训）。
@@ -707,7 +707,7 @@ def specs_for(frames, scene_of, sk, out, face_idx, prefix, dialogue=None, body_b
             has_asr = bool(dialogue.get(sid))
         specs.append(FrameSpec(
             frame_id=fn, scene_id=sid,
-            path=str(out / "preproc/frames" / f"{prefix}_f{fn}.jpg"),
+            path=str(out / "shikomi/frames" / f"{prefix}_f{fn}.jpg"),
             ts=fn / sk["fps"],
             faces=(face_idx[fn],) if face_idx.get(fn) else (),
             bodies=tuple(tuple(b[:4]) for b in body_bbox.get(f"{prefix}_f{fn}", ())),
@@ -770,7 +770,7 @@ def compute_clusters(segments, dino, thr=CLUSTER_THR):
 def single_img(seg, fn, face_idx, body_bbox, prefix, out_dir):
     """单帧段出图（2026-08-17 定稿）：读帧→检测→锁主体列→压背景→统一缩 cfg.height→
     压缩完打标（左1/4）。无人帧压 3:4 竖版；有人帧压背景锁主体列。"""
-    frame = _read_frame_bgr(out_dir.parent.parent / "preproc/frames" / f"{prefix}_f{fn}.jpg")
+    frame = _read_frame_bgr(out_dir.parent.parent / "shikomi/frames" / f"{prefix}_f{fn}.jpg")
     faces = (face_idx[fn],) if face_idx.get(fn) is not None else ()
     cfg = RibbonConfig(**RIB_CFG)
     H0, W0 = frame.shape[:2]

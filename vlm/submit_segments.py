@@ -2,7 +2,7 @@
 """vlm/submit_segments.py — 送检脚本（vlm 三件事之三：1.选帧 2.融合 3.送检）：自包含版
 （2026-08-18 大名），读选帧骨架 segments + 融合段图，按段类型送 VLM 生成 desc 写回骨架。
 
-用法（amaterasu env）: python vlm/submit_segments.py vivant [--ep EP01] [--limit N] [--force] [--fill-back]
+用法（sorosoro env）: python vlm/submit_segments.py vivant [--ep EP01] [--limit N] [--force] [--fill-back]
 依赖: output/<项目>/vlm/*_skeleton.json（选帧骨架）、vlm/segments/{seg}.jpg（融合段图）、
       vlm/vlm_prompts/ 提示词、vlm/desc_segments_template.json
 产物: output/<项目>/vlm/<prefix>_desc.json（VLM描述骨架）
@@ -378,7 +378,9 @@ def main():
         # （省 30%，0.92 时曾 9643）；单图/拼图推理 token 远低于 4096，ml 是上限安全值。
         llm = LLM(model=QWEN_MODEL_DIR, quantization="bitsandbytes", dtype="bfloat16",
                   max_model_len=int(os.environ.get("VLLM_MAX_MODEL_LEN", "4096")),
-                  gpu_memory_utilization=float(os.environ.get("VLLM_GPU_UTIL", "0.60")),
+                  gpu_memory_utilization=float(os.environ.get("VLLM_GPU_UTIL", "0.82")),
+                  max_num_batched_tokens=int(os.environ.get("VLLM_MAX_BATCHED_TOKENS", "4096")),
+                  max_num_seqs=int(os.environ.get("VLLM_MAX_NUM_SEQS", "64")),
                   enforce_eager=True)
         print("✔ vllm 就绪（Qwen3-VL-4B bnb4bit，continuous batching）", flush=True)
     else:

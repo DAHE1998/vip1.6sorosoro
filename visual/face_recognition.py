@@ -6,7 +6,7 @@
   Mode B 单视频:     python3 visual/face_recognition.py <视频名> --project <project_name> --video <vid_name>
   Mode B 全局:       python3 visual/face_recognition.py --project <project_name>
   可选: [--dino-filter --dino-cos 0.95]（DINO 均值过滤，生成 flat_dino HTML）
-依赖: visual/global_cos/gc_skeleton.json（帧处理目录，先跑 visual/global_cos.py）；preproc/frames/ 帧图；insightface 本地模型 buffalo_l（一切本地，禁联网下载）；--dino-filter 需 visual/dino/ DINO 向量
+依赖: visual/global_cos/gc_skeleton.json（帧处理目录，先跑 visual/global_cos.py）；shikomi/frames/ 帧图；insightface 本地模型 buffalo_l（一切本地，禁联网下载）；--dino-filter 需 visual/dino/ DINO 向量
 产物: face_head_fusion/person_timeline.json(+_meta)（canonical thr=0.40）、sweep_records.json 缓存；v01_visual_group/exp_sweep/ 各阈值 HTML
 """
 import json, os, sys, time, warnings, re, argparse, glob
@@ -81,12 +81,12 @@ def _patch_insightface_offline():
         pass
 
 def frames_dir(vn):
-    """帧图目录：统一 <out>/<项目>/preproc/frames/（2026-08-19 大名定稿新格式）"""
+    """帧图目录：统一 <out>/<项目>/shikomi/frames/（2026-08-19 大名定稿新格式）"""
     if OUT_ROOT:
-        return os.path.join(OUT_ROOT, "preproc", "frames")
+        return os.path.join(OUT_ROOT, "shikomi", "frames")
     if _mode_b:
-        return os.path.join(OUTPUT_DIR, _project_name, "preproc", "frames")
-    return os.path.join(OUTPUT_DIR, vn, "preproc", "frames")
+        return os.path.join(OUTPUT_DIR, _project_name, "shikomi", "frames")
+    return os.path.join(OUTPUT_DIR, vn, "shikomi", "frames")
 
 def get_suffix(name):
     """返回文件名后缀 _<name>"""
@@ -302,9 +302,9 @@ def detect_faces_global(project_name, force=False):
     sk["video_id"] = project_name
 
     if OUT_ROOT:
-        frames_base = os.path.join(OUT_ROOT, "preproc", "frames")
+        frames_base = os.path.join(OUT_ROOT, "shikomi", "frames")
     else:
-        frames_base = os.path.join(OUTPUT_DIR, project_name, "preproc", "frames")
+        frames_base = os.path.join(OUTPUT_DIR, project_name, "shikomi", "frames")
 
     # 解析每 scene frames 标记 → 计算源帧（簇 key + 单帧；黑帧跳过；簇成员共用簇 key 帧）
     source_scenes = defaultdict(list)     # (vh, fn) → [scene_idx...]（0-based 全局下标）
@@ -1005,11 +1005,16 @@ def dino_filter(recs, dino_emb, dino_cos_thr):
     return valid_pids, short_pids, merged_pids_set, dino_chains
 
 def build_person_timeline(recs, scenes, gap_max=3):
-    """将 pid-assigned recs 转为 per-scene person_timeline。"""
+    """将 pid-assigned recs 转为 per-scene person_timeline + 帧级 frame_map。
+    frame_map 键 = <video_hash>_f<帧号>（哈希贯穿全局：跨视频/跨 A/B 逻辑全局唯一），
+    值 = 该帧识别出的 pid 列表 —— 满足「无论 A/B，人脸识别记录 <哈希>_<帧号>: 识别结果」。"""
     pid_scenes = defaultdict(set)
+    frame_map = defaultdict(list)
     for r in recs:
         if r.get("pid") is not None:
             pid_scenes[r["pid"]].add(r["scene_id"])
+            frame_map[f"{r['video_id']}_f{r['frame']}"].append(r["pid"])
+    frame_map = {k: sorted(set(v)) for k, v in frame_map.items()}
     timeline = []
     for pid in sorted(pid_scenes):
         scene_ids = sorted(pid_scenes[pid])
@@ -1026,7 +1031,7 @@ def build_person_timeline(recs, scenes, gap_max=3):
                 start = prev = s
         intervals.append({"start_scene": int(start), "end_scene": int(prev), "n_scenes": prev - start + 1})
         timeline.append({"person_id": int(pid), "intervals": intervals})
-    return {"n_tracks": len(timeline), "timeline": timeline}
+    return {"n_tracks": len(timeline), "timeline": timeline, "frame_map": frame_map}
 
 def main():
     """命令行入口：解析参数 → 人脸检测（A/B/全局）→ 阈值扫描（并查集 / CW）→ 可选 DINO 过滤 → person_timeline 输出"""

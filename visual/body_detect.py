@@ -16,7 +16,7 @@ project_name = sys.argv[1]
 
 OUT_ROOT = os.environ.get("OUT_ROOT")
 video_dir = Path(OUT_ROOT) if OUT_ROOT else Path(PROJECT_DIR) / "output" / project_name
-frames_dir = video_dir / "preproc" / "frames"
+frames_dir = video_dir / "shikomi" / "frames"
 out_dir = video_dir / "visual" / "body_detect"
 out_dir.mkdir(parents=True, exist_ok=True)
 

@@ -5,7 +5,7 @@
   Mode A（单视频）:        python3 visual/dino_cluster.py <视频名>
   Mode B 全局:            python3 visual/dino_cluster.py "" <project_name>
   Mode B 单视频（供 dedup）: python3 visual/dino_cluster.py <vid_name> <project_name> <vid_name>
-依赖: preproc/select_frames/<vhash>_select_frames.json（key_frames 来源）；preproc/frames224/ 224×224 RGB bin（Preproc 已导出小图，零解码零 resize）；DINOv3 模型（DINO_MODEL_DIR）
+依赖: shikomi/select_frames/<vhash>_select_frames.json（key_frames 来源）；shikomi/frames224/ 224×224 RGB bin（Preproc 已导出小图，零解码零 resize）；DINOv3 模型（DINO_MODEL_DIR）
 产物: Mode A output/<视频名>/visual/dino/（<vhash>_key_frame_embeddings.npz、<vhash>_model_meta.json、<vhash>_skeleton.json）；Mode B 全局 output/<项目>/visual/dino/（key_frame_embeddings.npz 全局矩阵、frame_map.json、model_meta.json、global_similarity_matrix.npy、<vhash>_skeleton.json），并落 visual/dedup/ 骨架与 scene 视觉图
 """
 import json, sys, os, glob
@@ -138,7 +138,7 @@ def save_per_video(out_dir, vid, shots, meta=None):
 if mode_b_global:
     # ═══ Mode B: 全局 DINO ═══
     # 收集所有视频的 select_frames
-    sel_dir = os.path.join(OUT_ROOT if OUT_ROOT else os.path.join(PROJECT_DIR, "output", project_name), "preproc", "select_frames")
+    sel_dir = os.path.join(OUT_ROOT if OUT_ROOT else os.path.join(PROJECT_DIR, "output", project_name), "shikomi", "select_frames")
     sel_files = sorted(glob.glob(os.path.join(sel_dir, "*_select_frames.json")))
     if not sel_files:
         print(f"[04] Mode B 全局: 没有 select_frames in {sel_dir}")
@@ -158,7 +158,7 @@ if mode_b_global:
     all_kf = []   # [{video_id, local_frame, shot_id}, ...]
     all_video_shots = {}  # vid -> shots[]
     all_video_meta = {}  # vid -> select_frames 元数据（fps/video 透传）
-    frames_base = os.path.join(OUT_ROOT if OUT_ROOT else os.path.join(PROJECT_DIR, "output", project_name), "preproc", "frames224")
+    frames_base = os.path.join(OUT_ROOT if OUT_ROOT else os.path.join(PROJECT_DIR, "output", project_name), "shikomi", "frames224")
 
     for sf in sel_files:
         with open(sf) as f:
@@ -385,8 +385,8 @@ else:
     # ═══ Mode A / 单视频文件夹（per-video，输出到 project 目录）═══
     base_dir = project_name if mode_b else video_name
     out_base = OUT_ROOT if OUT_ROOT else os.path.join(PROJECT_DIR, "output", base_dir)
-    vh = load_video_hash(vid_name, os.path.join(out_base, "preproc", "skeleton"))
-    in_path = os.path.join(out_base, "preproc", "select_frames", f"{vh}_select_frames.json")
+    vh = load_video_hash(vid_name, os.path.join(out_base, "shikomi", "skeleton"))
+    in_path = os.path.join(out_base, "shikomi", "select_frames", f"{vh}_select_frames.json")
     kfs, shots = load_select_frames(in_path)
     seen = set()
     unique_kf = []
@@ -400,7 +400,7 @@ else:
     n_all = len(kfs)
     print(f"[04] DINO [{vid_name}]: {n_all} key_frames")
 
-    frames_base = os.path.join(out_base, "preproc", "frames224")
+    frames_base = os.path.join(out_base, "shikomi", "frames224")
     arr = np.zeros((n_all, S, S, 3), dtype=np.uint8)
     for i, kf in enumerate(kfs):
         img = read_frame(frames_base, vh, kf["local_frame"])
@@ -421,5 +421,13 @@ else:
             "input_size": S, "batch_size": BS2,
         }, f, ensure_ascii=False, indent=2)
     meta = json.load(open(in_path))
+    # 2026-08-24 fix: 保证 skeleton 中的 key_frames 与 npz 行数一致。
+    # load_select_frames 对缺 key_frames 的 shot 会 fallback 到中点帧并写入 npz，
+    # 但原始 shots 仍缺该字段，导致下游 fuse 报 "key_frames != npz 行数"。
+    # 这里同步给 skeleton 补上同样的 fallback key_frames。
+    for s in shots:
+        if not s.get("key_frames"):
+            mid = int((s["range"]["start"] + s["range"]["end"]) // 2)
+            s["key_frames"] = [mid]
     save_per_video(out_dir, vid_name, shots, meta)
     print(f"[04] DINO [{vid_name}]: {kf_emb.shape} -> {out_dir}/")

@@ -241,10 +241,10 @@ def main():
         # enforce_eager 免 cudagraph/torch.compile 工作区（省内存）。全部 env 可调。
         model = LLM(
             model=QWEN3_ASR_DIR,
-            gpu_memory_utilization=float(os.environ.get("ASR_GPU_UTIL", "0.50")),
+            gpu_memory_utilization=float(os.environ.get("ASR_GPU_UTIL", "0.80")),
             max_model_len=int(os.environ.get("ASR_MAX_MLEN", "2048")),
             max_num_seqs=int(os.environ.get("ASR_MAX_SEQS", "64")),
-            max_num_batched_tokens=int(os.environ.get("ASR_MAX_BATCH_TOKENS", "2048")),
+            max_num_batched_tokens=int(os.environ.get("ASR_MAX_BATCH_TOKENS", "4096")),
             enforce_eager=(os.environ.get("ASR_EAGER", "1") == "1"),
             allowed_local_media_path=tmpdir,
             disable_log_stats=True,

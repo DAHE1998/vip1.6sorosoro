@@ -3,8 +3,8 @@
 流程：读 dedup scene 骨架 → 提取非黑帧 scene 代表帧 → 读 DINO 向量 → 全局余弦矩阵 → 并查集聚类
       → 每 Cluster 选代表帧（视觉中心性 + 基础坏帧过滤 + face_present 优先，禁按时间选帧）→ 输出帧处理目录。
 
-用法（amaterasu env）: python visual/global_cos.py <video_dir> [--thr 0.9] [--save-cos]
-依赖: visual/dedup/<prefix>_skeleton.json（dedup scene 骨架，含 scene 代表帧）；visual/dino/<prefix>_key_frame_embeddings.npz（DINO 向量）；visual/face_detect/<name>_face_map.json（face_present，dedup 前全帧检测）；preproc/features/<prefix>_features.json（sharpness/yavg，坏帧轻量判定）
+用法（sorosoro env）: python visual/global_cos.py <video_dir> [--thr 0.9] [--save-cos]
+依赖: visual/dedup/<prefix>_skeleton.json（dedup scene 骨架，含 scene 代表帧）；visual/dino/<prefix>_key_frame_embeddings.npz（DINO 向量）；visual/face_detect/<name>_face_map.json（face_present，dedup 前全帧检测）；shikomi/features/<prefix>_features.json（sharpness/yavg，坏帧轻量判定）
 产物: visual/global_cos/gc_skeleton.json（唯一产物：scene 骨架帧处理目录，含完整 N×N 全局 cos 矩阵）；--save-cos 另存 gc_global_cos.npy
 """
 import argparse
@@ -164,11 +164,11 @@ def load_face_map(out, prefix):
 
 
 def load_features(out, prefix):
-    """读 preproc features（sharpness / quality[yavg]），坏帧轻量判定数据源。
+    """读 shikomi features（sharpness / quality[yavg]），坏帧轻量判定数据源。
     features 按帧序号（0 基）索引，长度 = total_frames。"""
-    p = out / "preproc" / "features" / f"{prefix}_features.json"
+    p = out / "shikomi" / "features" / f"{prefix}_features.json"
     if not p.exists():
-        raise SystemExit(f"❌ 无 features：{p}（先跑 preproc/duo_analyze）")
+        raise SystemExit(f"❌ 无 features：{p}（先跑 shikomi/kaiseki）")
     ft = json.loads(p.read_text(encoding="utf-8"))
     sharpness = np.array(ft["sharpness"], dtype=np.float32)
     quality = ft["quality"]

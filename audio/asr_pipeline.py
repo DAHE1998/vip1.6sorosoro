@@ -22,10 +22,10 @@ from srt_to_segments import find_srt
 SR = 16000
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-FFMPEG_BIN = os.environ.get("FFMPEG_BIN") or os.path.join(PROJECT_DIR, "ffmpeg-9.0", "ffmpeg")
+FFMPEG_BIN = os.environ.get("FFMPEG_BIN") or os.path.join(PROJECT_DIR, "ffmpeg", "ffmpeg")
 
 def extract_audio(video_path, out_wav):
-    """视频 → 16kHz mono WAV（项目根 ffmpeg-9.0 标准编译版，纯 CPU 抽音轨）"""
+    """视频 → 16kHz mono WAV（项目根 ffmpeg 标准编译版，纯 CPU 抽音轨）"""
     os.makedirs(os.path.dirname(out_wav), exist_ok=True)
     sp.run([
         FFMPEG_BIN, "-y", "-loglevel", "error",

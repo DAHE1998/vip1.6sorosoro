@@ -2,7 +2,7 @@
 """vlm/select_segments.py — 选帧脚本（vlm 三件事之一：1.选帧 2.融合 3.送检）：按簇共享方案
 （2026-08-21 定稿）直接读上游产物筛选 scene 融合成段，不二次计算。
 
-用法（amaterasu env）: python vlm/select_segments.py vivant [--ep EP01]
+用法（sorosoro env）: python vlm/select_segments.py vivant [--ep EP01]
 依赖: visual/global_cos/gc_skeleton.json、audio/dialogue/<hash>_dialogue.json、
       visual/face_detect/<hash>_face_map.json、visual/body_detect/body_bbox.json
 产物: output/<项目>/vlm/<hash>_skeleton.json（选帧骨架）

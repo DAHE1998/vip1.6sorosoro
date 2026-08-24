@@ -1,8 +1,8 @@
 #!/bin/bash
 # batch_pipeline.sh — 全流水线（VIP1.6zenkiru；A/B 逻辑按内容自动判定，自动跳过已完成步骤）
 # 用法: bash batch_pipeline.sh（调度脚本 run_batch.sh / remux_and_run.sh 调用；OUT_ROOT 可覆盖输出根）
-# 依赖: input/*.mp4 或 input/<folder>/ 视频；amaterasu conda 环境 + 模型路径（env/HF_HOME 布局推导）
-# 产物: output/<视频名或文件夹>/preproc/<模块>/<video_hash>_<产物> + visual/audio/vlm/... 下游产物
+# 依赖: input/*.mp4 或 input/<folder>/ 视频；sorosoro 自包含环境 + 模型路径（env/HF_HOME 布局推导）
+# 产物: output/<视频名或文件夹>/shikomi/<模块>/<video_hash>_<产物> + visual/audio/vlm/... 下游产物
 #
 # 输入处理（无严格 Mode，按内容自动适配）:
 #   input/*.mp4             → A 逻辑（单视频全流程）
@@ -11,7 +11,7 @@
 #   混合（视频+文件夹共存）→ 先处理视频，再处理文件夹
 # 输出协议:
 #   A 逻辑 → output/<视频名>/；B 逻辑 → output/<文件夹名>/；OUT_ROOT 显式覆盖
-#   preproc/ 下: cuts / skeleton / select_frames / events / features / frames / frames224
+#   shikomi/ 下: cuts / skeleton / select_frames / events / features / frames / frames224
 #   命名: <video_hash>_<模块>.json（内容哈希前缀，A/B 统一；scdet → cuts，不暴露滤镜名）
 # 流程: scdet→skeleton→select_frames→抽帧→DINOv3→face_detect→dedup→face_recognition
 #   →onion_model→body_detect→audio→vlm(select→fuse→submit)
@@ -19,16 +19,31 @@
 set -e
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || exit 1
 
+# 绑定项目自带 sorosoro python（nohup 后台 conda activate 失效兜底；环境随项目自包含）
+PROJ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PYTHON="${PYTHON:-$PROJ_ROOT/env/sorosoro/bin/python3}"
+export PATH="$PROJ_ROOT/env/sorosoro/bin:$PATH"   # env bin on PATH for subprocesses (ninja/ffmpeg)
+
+# 让 onnxruntime / vllm 找到 conda 里的 CUDA 13 运行库（无版本号软链已建）
+export LD_LIBRARY_PATH=$PROJ_ROOT/env/sorosoro/lib/python3.11/site-packages/nvidia/cublas/lib:$PROJ_ROOT/env/sorosoro/lib/python3.11/site-packages/nvidia/cuda_runtime/lib:$PROJ_ROOT/env/sorosoro/lib/python3.11/site-packages/nvidia/cudnn/lib:$PROJ_ROOT/env/sorosoro/lib/python3.11/site-packages/nvidia/cufft/lib:$PROJ_ROOT/env/sorosoro/lib/python3.11/site-packages/nvidia/curand/lib:$PROJ_ROOT/env/sorosoro/lib/python3.11/site-packages/nvidia/cusolver/lib:$PROJ_ROOT/env/sorosoro/lib/python3.11/site-packages/nvidia/cusparse/lib:$PROJ_ROOT/env/sorosoro/lib/python3.11/site-packages/nvidia/cufile/lib:$PROJ_ROOT/env/sorosoro/lib/python3.11/site-packages/nvidia/nvjitlink/lib:$PROJ_ROOT/env/sorosoro/lib/python3.11/site-packages/nvidia/nvtx/lib:$LD_LIBRARY_PATH
+# 限制 CPU-bound 步骤（face_detect/dedup 等）的 OpenMP/MKL 线程数，避免 CPU 全红
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
+export MKL_NUM_THREADS="${MKL_NUM_THREADS:-4}"
+export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-4}"
+export VECLIB_MAXIMUM_THREADS="${VECLIB_MAXIMUM_THREADS:-4}"
+export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-4}"
+
 conda_activate() {
-  source "${CONDA_SH:?set CONDA_SH to your conda.sh path}"
-  conda activate "${CONDA_ENV:-base}"
+  # 已废弃：nohup/后台子 shell 里 conda activate 不可靠；
+  # 统一使用 $PYTHON 绝对路径（$PROJ_ROOT/env/sorosoro/bin/python3）
+  :
 }
 
 # ═══ 模型路径（统一环境变量管理，零硬编码，═══
 # 每个模型同一模式：显式 <VAR> 优先 → 按 HF_HOME（默认 /models/hf）布局推导 → 找不到报错提示
 # 布局推导：$HF_HOME/<org>/<id>/（手动下载）→ $HF_HOME/hub/models--<org>--<id>/snapshots/*（HF 标准）
 #           $HF_HOME/hub/<org>/<id>/（hub 直放）→ $HF_HOME/../modelscope/<org>/<id>（modelscope）
-HF_HOME="${HF_HOME:-/models/hf}"
+export HF_HOME="${HF_HOME:-/models/hf}"
 model_locate() { # <变量名> <候选目录...>：显式 env 有效则用，否则取第一个存在的候选，全无则报错
   local var="$1"; shift
   local val="${!var}"
@@ -63,7 +78,7 @@ model_locate QWEN_MODEL_DIR \
   "$HF_HOME/qwen35_hybrid_4bit" \
   "$HF_HOME/hub/Qwen/Qwen3___5-4B" \
   "$HF_HOME/hub/Qwen/Qwen3.5-9B" || exit 1
-# chapter 划章脚本兼容旧 MODEL_PATH 变量名
+# yovisual 划章脚本兼容旧 MODEL_PATH 变量名
 export MODEL_PATH="$QWEN_MODEL_DIR"
 
 input_dir="$PWD/input"
@@ -124,19 +139,19 @@ process_video_steps_1_4() {
   echo ""
   echo "======= [$vid_name] $(date) ======="
   echo "  视频: $mp4"
-  echo "  输出: $out_root/preproc/"
+  echo "  输出: $out_root/shikomi/"
 
-  # 1-4. duo_analyze（双线一体，一次解码全产出：cuts/skeleton/select_frames/events/features
+  # 1-4. kaiseki（单路解析器，一次解码全产出：cuts/skeleton/select_frames/events/features
   #       + 抽帧（短边 960，+ frames224；cubin 按 /proc/self/exe 定位，无需 cd）
   # 缓存判断（2026-08-19 大名：判重只用内容哈希）：先预检测输入视频内容哈希，
-  # preproc 骨架 <hash>_skeleton.json 已存在 = 该视频预处理已完整产出 → 停止处理
+  # shikomi 骨架 <hash>_skeleton.json 已存在 = 该视频预处理已完整产出 → 停止处理
   local vh
   vh=$(content_hash "$mp4")
-  if [ -f "$out_root/preproc/skeleton/${vh}_skeleton.json" ]; then
-    echo "[ 1-4/12] duo_analyze: cached ($vh)"
+  if [ -f "$out_root/shikomi/skeleton/${vh}_skeleton.json" ]; then
+    echo "[ 1-4/12] kaiseki: cached ($vh)"
   else
-    echo "[ 1-4/12] duo_analyze（双线一体，短边 960 抽帧）..."
-    ./preproc/duo_analyze -o "$out_root" "$mp4" 2>&1 | tail -5
+    echo "[ 1-4/12] kaiseki（单路解析器，短边 960 抽帧）..."
+    ./shikomi/kaiseki -o "$out_root" "$mp4" 2>&1 | tail -5
   fi
 }
 
@@ -158,9 +173,9 @@ run_dino() {
     echo "[ 5/12] dino_cluster [$vh]..."
     conda_activate
     if [ -n "$project_label" ]; then
-      OUT_ROOT="$out_root" python3 visual/dino_cluster.py "$vh" "$project_label" "$vh" 2>&1 | tail -5
+      OUT_ROOT="$out_root" "$PYTHON" visual/dino_cluster.py "$vh" "$project_label" "$vh" 2>&1 | tail -5
     else
-      OUT_ROOT="$out_root" python3 visual/dino_cluster.py "$vh" 2>&1 | tail -5
+      OUT_ROOT="$out_root" "$PYTHON" visual/dino_cluster.py "$vh" 2>&1 | tail -5
     fi
   else
     # 全局 DINO（B 逻辑）
@@ -173,7 +188,7 @@ run_dino() {
     fi
     echo "[ 5/12] dino_cluster (全局)..."
     conda_activate
-    OUT_ROOT="$out_root" python3 visual/dino_cluster.py "" "$project_label" 2>&1 | tail -5
+    OUT_ROOT="$out_root" "$PYTHON" visual/dino_cluster.py "" "$project_label" 2>&1 | tail -5
   fi
 }
 
@@ -197,9 +212,9 @@ run_face_detect() {
   echo "[ 6/12] face_detect [$vhash]..."
   conda_activate
   if [ -n "$project_label" ]; then
-    OUT_ROOT="$out_root" python3 visual/face_detect.py "$vhash" "$project_label" "$vhash" 2>&1 | tail -5
+    OUT_ROOT="$out_root" "$PYTHON" visual/face_detect.py "$vhash" "$project_label" "$vhash" 2>&1 | tail -5
   else
-    OUT_ROOT="$out_root" python3 visual/face_detect.py "$vhash" 2>&1 | tail -5
+    OUT_ROOT="$out_root" "$PYTHON" visual/face_detect.py "$vhash" 2>&1 | tail -5
   fi
 }
 
@@ -232,9 +247,9 @@ process_video_steps_6_12() {
     echo "[ 7/12] dedup..."
     conda_activate
     if [ -n "$project_label" ]; then
-      OUT_ROOT="$out_root" python3 visual/dedup.py "$vh" "$project_label" "$vh" 2>&1 | tail -5
+      OUT_ROOT="$out_root" "$PYTHON" visual/dedup.py "$vh" "$project_label" "$vh" 2>&1 | tail -5
     else
-      OUT_ROOT="$out_root" python3 visual/dedup.py "$vh" 2>&1 | tail -5
+      OUT_ROOT="$out_root" "$PYTHON" visual/dedup.py "$vh" 2>&1 | tail -5
     fi
   fi
 
@@ -246,7 +261,7 @@ process_video_steps_6_12() {
   else
     echo "[7.5/12] global_cos（全局聚簇）..."
     conda_activate
-    OUT_ROOT="$out_root" python3 visual/global_cos.py "$vid_name" 2>&1 | tail -5
+    OUT_ROOT="$out_root" "$PYTHON" visual/global_cos.py "$vid_name" 2>&1 | tail -5
   fi
 
   # 8. face_recognition（每视频）
@@ -261,9 +276,9 @@ process_video_steps_6_12() {
     echo "[ 8/12] face_recognition..."
     conda_activate
     if [ -n "$project_label" ]; then
-      OUT_ROOT="$out_root" python3 visual/face_recognition.py "$vh" --dino-filter --project "$project_label" --video "$vh" 2>&1 | tail -8
+      OUT_ROOT="$out_root" "$PYTHON" visual/face_recognition.py "$vh" --dino-filter --project "$project_label" --video "$vh" 2>&1 | tail -8
     else
-      OUT_ROOT="$out_root" python3 visual/face_recognition.py "$vh" --dino-filter 2>&1 | tail -8
+      OUT_ROOT="$out_root" "$PYTHON" visual/face_recognition.py "$vh" --dino-filter 2>&1 | tail -8
     fi
   fi
 
@@ -276,9 +291,9 @@ process_video_steps_6_12() {
     echo "[ 9/12] onion_model..."
     conda_activate
     if [ -n "$project_label" ]; then
-      OUT_ROOT="$out_root" python3 visual/onion_model.py "$vh" "$project_label" "$vh" 2>&1 | tail -5
+      OUT_ROOT="$out_root" "$PYTHON" visual/onion_model.py "$vh" "$project_label" "$vh" 2>&1 | tail -5
     else
-      OUT_ROOT="$out_root" python3 visual/onion_model.py "$vh" 2>&1 | tail -5
+      OUT_ROOT="$out_root" "$PYTHON" visual/onion_model.py "$vh" 2>&1 | tail -5
     fi
   fi
 
@@ -292,7 +307,7 @@ process_video_steps_6_12() {
   else
     echo "[9.5/12] body_detect..."
     conda_activate
-    OUT_ROOT="$out_root" python3 visual/body_detect.py "${project_label:-$vid_name}" 2>&1 | tail -5
+    OUT_ROOT="$out_root" "$PYTHON" visual/body_detect.py "${project_label:-$vid_name}" 2>&1 | tail -5
   fi
 
   # 10. audio ASR pipeline
@@ -304,16 +319,16 @@ process_video_steps_6_12() {
     echo "[10/12] audio..."
     conda_activate
     if [ -n "$project_label" ]; then
-      OUT_ROOT="$out_root" python3 audio/asr_pipeline.py "$vh" "$project_label" "$vh" 2>&1 | tail -8
+      OUT_ROOT="$out_root" "$PYTHON" audio/asr_pipeline.py "$vh" "$project_label" "$vh" 2>&1 | tail -8
     else
-      OUT_ROOT="$out_root" python3 audio/asr_pipeline.py "$vh" 2>&1 | tail -8
+      OUT_ROOT="$out_root" "$PYTHON" audio/asr_pipeline.py "$vh" 2>&1 | tail -8
     fi
   fi
 
   # 11.5 vlm 三件套① select_segments（选帧；读 dedup/dino/face_map/body_bbox）。
   #      vlm 只读 ASR 判 has_asr（有无台词），台词不嵌进骨架、只读不写 ASR 的东西；
   #      缓存判断不依赖 audio（vlm 不依赖 ASR，graph_merge 已废弃不进，
-  #      pipeline 到 vlm desc 为止——chapter 划章待修不串）
+  #      pipeline 到 vlm desc 为止——yovisual 划章待修不串）
   local sel_skel
   sel_skel="$out_root/vlm/${vh}_skeleton.json"
   if [ -f "$sel_skel" ] && [ "$sel_skel" -nt "$body_dep_sk" ]; then
@@ -321,7 +336,7 @@ process_video_steps_6_12() {
   else
     echo "[11.5/12] vlm select (选帧)..."
     conda_activate
-    python3 vlm/select_segments.py "$vid_name" 2>&1 | tail -5
+    "$PYTHON" vlm/select_segments.py "$vid_name" 2>&1 | tail -5
   fi
 
   # 11.6 vlm 三件套② fuse_segments（融合拼图；读 select 骨架 + frames + DINO，
@@ -333,19 +348,19 @@ process_video_steps_6_12() {
   else
     echo "[11.6/12] vlm fuse (融合拼图)..."
     conda_activate
-    python3 vlm/fuse_segments.py "$vid_name" 2>&1 | tail -5
+    "$PYTHON" vlm/fuse_segments.py "$vid_name" 2>&1 | tail -5
   fi
 
   # 11.7 vlm 三件套③ submit_segments（送检 VLM desc；vllm continuous batching，
-  #      落 vlm/<vhash>_desc.json；vllm env 跑，禁 amaterasu）——pipeline 终点
+  #      落 vlm/<vhash>_desc.json；sorosoro 环境内 vllm 跑）——pipeline 终点
   local desc_out
   desc_out="$out_root/vlm/${vh}_desc.json"
   if [ -f "$desc_out" ] && [ "$desc_out" -nt "$fused_out" ]; then
     echo "[11.7/12] vlm desc: cached"
   else
-    echo "[11.7/12] vlm desc (Qwen3-VL-4B vllm, amaterasu)..."
+    echo "[11.7/12] vlm desc (Qwen3-VL-4B vllm, sorosoro)..."
     conda_activate
-    python3 vlm/submit_segments.py "$vid_name" 2>&1 | tail -6
+    "$PYTHON" vlm/submit_segments.py "$vid_name" 2>&1 | tail -6
   fi
 
   echo "=== [$vid_name] 完成 ==="
@@ -377,7 +392,7 @@ process_video_steps_9_12() {
   else
     echo "[ 9/11] onion_model..."
     conda_activate
-    PERSON_SCENE_OFFSET="$person_offset" OUT_ROOT="$out_root" python3 visual/onion_model.py "$vh" "$project_label" "$vh" 2>&1 | tail -5
+    PERSON_SCENE_OFFSET="$person_offset" OUT_ROOT="$out_root" "$PYTHON" visual/onion_model.py "$vh" "$project_label" "$vh" 2>&1 | tail -5
   fi
 
   # 10. audio ASR pipeline
@@ -387,8 +402,22 @@ process_video_steps_9_12() {
     echo "[10/11] audio: cached"
   else
     echo "[10/11] audio..."
+    # vLLM EngineCore 与 OMP/MKL 等线程限制变量冲突（设 4 线程会触发 40 线程 futex 死锁），
+    # 临时清除让 vLLM 自行调度；audio 结束后再恢复，避免影响前面/后面的 CPU 密集步骤。
+    local _saved_omp _saved_mkl _saved_openblas _saved_veclib _saved_numexpr
+    _saved_omp="${OMP_NUM_THREADS:-}"
+    _saved_mkl="${MKL_NUM_THREADS:-}"
+    _saved_openblas="${OPENBLAS_NUM_THREADS:-}"
+    _saved_veclib="${VECLIB_MAXIMUM_THREADS:-}"
+    _saved_numexpr="${NUMEXPR_NUM_THREADS:-}"
+    unset OMP_NUM_THREADS MKL_NUM_THREADS OPENBLAS_NUM_THREADS VECLIB_MAXIMUM_THREADS NUMEXPR_NUM_THREADS
     conda_activate
-    OUT_ROOT="$out_root" python3 audio/asr_pipeline.py "$vh" "$project_label" "$vh" 2>&1 | tail -8
+    OUT_ROOT="$out_root" "$PYTHON" audio/asr_pipeline.py "$vh" "$project_label" "$vh" 2>&1 | tail -8
+    if [ -n "$_saved_omp" ]; then export OMP_NUM_THREADS="$_saved_omp"; else unset OMP_NUM_THREADS; fi
+    if [ -n "$_saved_mkl" ]; then export MKL_NUM_THREADS="$_saved_mkl"; else unset MKL_NUM_THREADS; fi
+    if [ -n "$_saved_openblas" ]; then export OPENBLAS_NUM_THREADS="$_saved_openblas"; else unset OPENBLAS_NUM_THREADS; fi
+    if [ -n "$_saved_veclib" ]; then export VECLIB_MAXIMUM_THREADS="$_saved_veclib"; else unset VECLIB_MAXIMUM_THREADS; fi
+    if [ -n "$_saved_numexpr" ]; then export NUMEXPR_NUM_THREADS="$_saved_numexpr"; else unset NUMEXPR_NUM_THREADS; fi
   fi
 
   # 10.5 vlm 三件套① select_segments（选帧；B 逻辑 video_dir=项目名 --ep=本集）。
@@ -401,7 +430,7 @@ process_video_steps_9_12() {
   else
     echo "[10.5/11] vlm select (选帧)..."
     conda_activate
-    python3 vlm/select_segments.py "$project_label" --ep "$vh" 2>&1 | tail -5
+    "$PYTHON" vlm/select_segments.py "$project_label" --ep "$vh" 2>&1 | tail -5
   fi
 
   # 10.6 vlm 三件套② fuse_segments（融合拼图；读 select 骨架 + frames + DINO）
@@ -412,19 +441,32 @@ process_video_steps_9_12() {
   else
     echo "[10.6/11] vlm fuse (融合拼图)..."
     conda_activate
-    python3 vlm/fuse_segments.py "$project_label" --ep "$vh" 2>&1 | tail -5
+    "$PYTHON" vlm/fuse_segments.py "$project_label" --ep "$vh" 2>&1 | tail -5
   fi
 
   # 10.7 vlm 三件套③ submit_segments（送检 VLM desc；vllm continuous batching，
-  #      落 vlm/<vhash>_desc.json；vllm env 跑，禁 amaterasu）——pipeline 终点
+  #      落 vlm/<vhash>_desc.json；sorosoro 环境内 vllm 跑）——pipeline 终点
   local desc_out
   desc_out="$out_root/vlm/${vh}_desc.json"
   if [ -f "$desc_out" ] && [ "$desc_out" -nt "$fused_out" ]; then
     echo "[10.7/11] vlm desc: cached"
   else
-    echo "[10.7/11] vlm desc (Qwen3-VL-4B vllm, amaterasu)..."
+    echo "[10.7/11] vlm desc (Qwen3-VL-4B vllm, sorosoro)..."
+    # vLLM EngineCore 与 OMP/MKL 等线程限制变量冲突，临时清除。
+    local _saved_omp _saved_mkl _saved_openblas _saved_veclib _saved_numexpr
+    _saved_omp="${OMP_NUM_THREADS:-}"
+    _saved_mkl="${MKL_NUM_THREADS:-}"
+    _saved_openblas="${OPENBLAS_NUM_THREADS:-}"
+    _saved_veclib="${VECLIB_MAXIMUM_THREADS:-}"
+    _saved_numexpr="${NUMEXPR_NUM_THREADS:-}"
+    unset OMP_NUM_THREADS MKL_NUM_THREADS OPENBLAS_NUM_THREADS VECLIB_MAXIMUM_THREADS NUMEXPR_NUM_THREADS
     conda_activate
-    python3 vlm/submit_segments.py "$project_label" --ep "$vh" 2>&1 | tail -6
+    "$PYTHON" vlm/submit_segments.py "$project_label" --ep "$vh" 2>&1 | tail -6
+    if [ -n "$_saved_omp" ]; then export OMP_NUM_THREADS="$_saved_omp"; else unset OMP_NUM_THREADS; fi
+    if [ -n "$_saved_mkl" ]; then export MKL_NUM_THREADS="$_saved_mkl"; else unset MKL_NUM_THREADS; fi
+    if [ -n "$_saved_openblas" ]; then export OPENBLAS_NUM_THREADS="$_saved_openblas"; else unset OPENBLAS_NUM_THREADS; fi
+    if [ -n "$_saved_veclib" ]; then export VECLIB_MAXIMUM_THREADS="$_saved_veclib"; else unset VECLIB_MAXIMUM_THREADS; fi
+    if [ -n "$_saved_numexpr" ]; then export NUMEXPR_NUM_THREADS="$_saved_numexpr"; else unset NUMEXPR_NUM_THREADS; fi
   fi
 
   echo "=== [$vid_name] 完成 ==="
@@ -446,7 +488,7 @@ run_global_face_recognition() {
 
   echo "[ 8/12] face_recognition (全局)..."
   conda_activate
-  OUT_ROOT="$out_root" python3 visual/face_recognition.py "" --dino-filter --project "$project_label" 2>&1 | tail -8
+  OUT_ROOT="$out_root" "$PYTHON" visual/face_recognition.py "" --dino-filter --project "$project_label" 2>&1 | tail -8
 }
 
 # ── 处理一个文件夹（按视频数判定 A/B 逻辑）──
@@ -477,7 +519,7 @@ process_folder() {
   echo ""
   echo "############################################################"
   echo "# 项目: $folder_name"
-  echo "# 输出: $out_root/preproc/"
+  echo "# 输出: $out_root/shikomi/"
   echo "############################################################"
 
   if [ "$n_vids" -eq 1 ]; then
@@ -530,7 +572,7 @@ process_folder() {
       else
         echo "[ 7/12] dedup [$vh]..."
         conda_activate
-        OUT_ROOT="$out_root" python3 visual/dedup.py "$vh" 2>&1 | tail -5
+        OUT_ROOT="$out_root" "$PYTHON" visual/dedup.py "$vh" 2>&1 | tail -5
       fi
     done
 
@@ -542,7 +584,7 @@ process_folder() {
     else
       echo "[7.5/12] global_cos（全局聚簇）..."
       conda_activate
-      OUT_ROOT="$out_root" python3 visual/global_cos.py "$folder_name" 2>&1 | tail -5
+      OUT_ROOT="$out_root" "$PYTHON" visual/global_cos.py "$folder_name" 2>&1 | tail -5
     fi
 
     # ── 步骤 9.5: body_detect 全局（人体检测；每项目全局一份 body_bbox.json，键对齐 gc
@@ -554,18 +596,19 @@ process_folder() {
     else
       echo "[9.5/11] body_detect（全局）..."
       conda_activate
-      OUT_ROOT="$out_root" python3 visual/body_detect.py "$folder_name" 2>&1 | tail -5
+      OUT_ROOT="$out_root" "$PYTHON" visual/body_detect.py "$folder_name" 2>&1 | tail -5
     fi
 
     # ── 步骤 8: face_recognition 全局 ──
     run_global_face_recognition "$out_root" "$folder_name"
+
 
     # ── 步骤 9-12: 逐视频（人物段偏移 = 前集 dedup scenes 累计）──
     person_offset=0
     for mp4 in "${FOLDER_VIDEOS[@]}"; do
       process_video_steps_9_12 "$mp4" "$folder_name" "$out_root" "$person_offset"
       local vh; vh=$(content_hash "$mp4")
-      person_offset=$((person_offset + $(python3 -c "import json;print(len(json.load(open('$out_root/visual/dedup/${vh}_skeleton.json'))['scenes']))")))
+      person_offset=$((person_offset + $("$PYTHON" -c "import json;print(len(json.load(open('$out_root/visual/dedup/${vh}_skeleton.json'))['scenes']))")))
     done
   fi
 }

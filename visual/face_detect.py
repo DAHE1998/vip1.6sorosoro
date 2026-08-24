@@ -23,7 +23,7 @@ elif mode_b:
 else:
     video_dir = os.path.join(PROJECT_DIR, "output", video_name)
 vis_dir = os.path.join(video_dir, "visual", "face_detect")
-frames_dir = os.path.join(video_dir, "preproc", "frames")
+frames_dir = os.path.join(video_dir, "shikomi", "frames")
 os.makedirs(vis_dir, exist_ok=True)
 
 def load_video_hash(vid_name, skel_dir):

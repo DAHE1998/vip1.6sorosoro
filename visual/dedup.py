@@ -6,7 +6,7 @@
 ASR 注入不在 dedup 做（由 chapter 步骤 assemble.py 负责）。
 
 用法: python3 visual/dedup.py <视频名> [<project_name> <vid_name>]
-依赖: dino/<vhash>_key_frame_embeddings.npz（DINO 只出向量，矩阵自算）；dino/<vhash>_skeleton.json（shots/key_frames 来源）；face_detect/<vid>_face_map.json（有脸帧优先）；黑帧段读 preproc/events black_segments 与 features yavg 兜底（2026-08-17 大名）
+依赖: dino/<vhash>_key_frame_embeddings.npz（DINO 只出向量，矩阵自算）；dino/<vhash>_skeleton.json（shots/key_frames 来源）；face_detect/<vid>_face_map.json（有脸帧优先）；黑帧段读 shikomi/events black_segments 与 features yavg 兜底（2026-08-17 大名）
 产物: visual/dedup/<vid>_skeleton.json（scenes 骨架）、<vid>_scene_visual_graph.npy、<vid>_removed_frames.json、<vid>_model_meta.json
 """
 import json, os, sys, glob
@@ -97,15 +97,15 @@ all_removed = set()
 # ── 黑帧帧（合并约束 + 黑帧独立 scene）──
 def _load_black_frames(video_dir, vhash):
     """加载黑帧帧号集合（2026-08-17 大名：黑帧帧为合并约束 + 独立成黑帧 scene）。
-    长黑段：preproc/events.json black_segments（blackdetect_vulkan，≥2s）；
+    长黑段：shikomi/events.json black_segments（blackdetect_vulkan，≥2s）；
     短黑段补检：features.json 逐帧 yavg<20 连续 ≥0.5s（blackdetect 漏检兜底）。"""
     black_frames = set()
-    ev_path = os.path.join(video_dir, "preproc", "events", f"{vhash}_events.json")
+    ev_path = os.path.join(video_dir, "shikomi", "events", f"{vhash}_events.json")
     if os.path.isfile(ev_path):
         ev = json.load(open(ev_path))
         for b in ev.get("black_segments", []):
             black_frames.update(range(int(b["start_frame"]), int(b["end_frame"]) + 1))
-    fe_path = os.path.join(video_dir, "preproc", "features", f"{vhash}_features.json")
+    fe_path = os.path.join(video_dir, "shikomi", "features", f"{vhash}_features.json")
     if os.path.isfile(fe_path):
         fe = json.load(open(fe_path))
         yavg = [x["yavg"] for x in fe.get("quality", [])]
@@ -272,7 +272,7 @@ np.save(os.path.join(out_dir, f"{vid_name}_scene_visual_graph.npy"),
         sim[np.ix_(kf_idx, kf_idx)].astype(np.float32))
 
 # 场景 id 命名（2026-08-18 大名定稿）：16 位 video_hash 内容指纹（与
-# preproc/frames/ 帧前缀同源，贯穿全场唯一）+ Scene{序号}（Scene 与序号间无下划线）。
+# shikomi/frames/ 帧前缀同源，贯穿全场唯一）+ Scene{序号}（Scene 与序号间无下划线）。
 # 例：d4f40304e63203ee_Scene01；图片名 = 骨架 id + _ + 绝对帧号。
 for i, sc in enumerate(scenes):
     sc["id"] = f"{vh}_Scene{i + 1:02d}"

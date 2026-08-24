@@ -49,12 +49,12 @@ OUT_NAME = os.environ.get("BND_OUT") or (f"{V}_scene_asr_editor.html" if (mode_b
 if mode_b and video_out_dir:
     ASR_PATH = os.path.join(video_out_dir, "audio", "dialogue", f"{V}_dialogue.json")
     BND_PATH = os.path.join(video_out_dir, "chapter", "chapter_boundaries", BND_NAME)
-    FRAMES = os.path.join(video_out_dir, "preproc", "frames")
+    FRAMES = os.path.join(video_out_dir, "shikomi", "frames")
     OUT = os.path.join(video_out_dir, "chapter", "editor", OUT_NAME)
 else:
     ASR_PATH = f"{BASE}/output/{V}/audio/dialogue/{V}_dialogue.json"
     BND_PATH = f"{BASE}/output/{V}/chapter/chapter_boundaries/{BND_NAME}"
-    FRAMES = f"{BASE}/output/{V}/preproc/frames"
+    FRAMES = f"{BASE}/output/{V}/shikomi/frames"
     OUT = f"{BASE}/output/{V}/chapter/editor/{OUT_NAME}"
 
 # 帧文件前缀（2026-08-14：骨架重建后按 fnv6(视频全名) 命名，不能 fnv6(V) 目录名算）
@@ -271,7 +271,7 @@ video_info_html = (
 
 def load_b64(fn):
     """帧引用路径：改回服务器静态文件引用——serve_viz 直接 serve output/，
-    src=/<视频名>/preproc/frames/{FP}_f{fn}.jpg 浏览器按需加载，HTML 只有几百 KB"""
+    src=/<视频名>/shikomi/frames/{FP}_f{fn}.jpg 浏览器按需加载，HTML 只有几百 KB"""
     p = os.path.join(FRAMES, f"{FP}_f" + str(fn) + ".jpg")
     if not os.path.exists(p):
         return None
@@ -431,7 +431,7 @@ if os.path.isfile(DEDUP_PATH):
         sc["scene_id"] = n  # dedup 用 id 字符串，face 卡片标注统一按序号
     # 帧集展开：dedup scenes.frames 只留每 scene 的 key_frame（180 帧，被合并吞掉的
     # 帧缺失）。face 视图每 scene 的帧 = shot_range 内全部 shots 的 key_frames，
-    # 259 帧全覆盖，与 preproc/frames 的帧文件一一对应
+    # 259 帧全覆盖，与 shikomi/frames 的帧文件一一对应
     dedup_shots = dedup_all.get("shots", [])
     for sc in dedup_scenes:
         r = sc["shot_range"]

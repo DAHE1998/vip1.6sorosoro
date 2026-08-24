@@ -8,7 +8,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 export CONDA_SH=/home/dahe/miniconda3/etc/profile.d/conda.sh
-export CONDA_ENV=amaterasu
+export CONDA_ENV=sorosoro
 export OUT_ROOT="${OUT_ROOT:-$SCRIPT_DIR/output/vivant}"
 API_KEY_FILE="$SCRIPT_DIR/chapter/api_key.txt"
 if [ -f "$API_KEY_FILE" ]; then
