@@ -1,5 +1,0 @@
-# 模型接口密钥配置（二行格式）
-# 第 1 行 = base_url（一般不用改）
-# 第 2 行 = API key，把下面的 123456 换成你自己的 key（如 ms-xxxx…）
-https://api-inference.modelscope.cn/v1
-123456

@@ -8,3 +8,8 @@ input/
 *.a
 *.log
 .DS_Store
+shikomi/ffmpeg_static/
+env/
+*.cubin
+shikomi/kaiseki
+chapter/api_key.txt
