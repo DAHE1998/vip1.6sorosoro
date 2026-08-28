@@ -68,19 +68,20 @@ static int shot_cmp(const void *a, const void *b) {
     return ((const Shot *)a)->start - ((const Shot *)b)->start;
 }
 
-static double probe_fps(const char *video_path) {
-    char cmd[4096];
-    snprintf(cmd, sizeof(cmd),
-        "ffprobe -v quiet -select_streams v:0 "
-        "-show_entries stream=avg_frame_rate "
-        "-of default=noprint_wrappers=1:nokey=1 '%s'", video_path);
-    FILE *fp = popen(cmd, "r");
-    if (!fp) return 30.0;
-    char buf[64]; fgets(buf, sizeof(buf), fp);
-    pclose(fp);
-    int num = 30000, den = 1001;
-    sscanf(buf, "%d/%d", &num, &den);
-    return (double)num / den;
+/* 平衡括号树构造 force_key_frames 帧号表达式。
+ * 关键：199 项 eq(n,X) 若用左结合 + 会成深度 ~199，超 ffmpeg MAX_DEPTH(100)。
+ * 用平衡二分 (a+b)+(c+d) 把深度压到 log2(n)，任意段数都不超限制。
+ * 语义：eq(n,X) 在帧 n==X 时为 1，+ 相加非零即强制该帧为关键帧。 */
+static void build_bal_expr(char *buf, size_t bufsz, const int *starts, int lo, int hi) {
+    if (lo == hi) {
+        snprintf(buf, bufsz, "eq(n,%d)", starts[lo]);
+        return;
+    }
+    int mid = (lo + hi) / 2;
+    char left[16384], right[16384];
+    build_bal_expr(left,  sizeof(left),  starts, lo, mid);
+    build_bal_expr(right, sizeof(right), starts, mid + 1, hi);
+    snprintf(buf, bufsz, "(%s+%s)", left, right);
 }
 
 int main(int argc, char *argv[]) {
@@ -104,27 +105,30 @@ int main(int argc, char *argv[]) {
       if (s) { int d = (int)(s - argv[1]); strncpy(out_dir, argv[1], d); out_dir[d]='\0'; }
       else strcpy(out_dir, "."); }
 
-    double fps = probe_fps(video_path);
-    printf("Video: %s\nShots: %d  FPS: %.4f\n", video_path, n_shots, fps);
+    printf("Video: %s\nShots: %d\n", video_path, n_shots);
 
-    /* ── Build timestamp string (comma-separated, no expr: prefix) ── */
-    char *timestamps = malloc(n_shots * 16);
-    if (!timestamps) { fprintf(stderr, "OOM\n"); return 1; }
-    timestamps[0] = '\0';
-    int ts_len = 0;
+    /* ── 官方组合：-force_key_frames expr:eq(n,X)（强制帧号关键帧，变量 n=帧号）
+     *        + -f segment -segment_frames <结束帧>（按帧号精确切分）─
+     * 帧号驱动，零 fps 秒换算，不抽搐。 */
+    int *starts = malloc((size_t)n_shots * sizeof(int));
+    if (!starts) { fprintf(stderr, "OOM\n"); return 1; }
+    for (int i = 0; i < n_shots; i++) starts[i] = shots[i].start;
+    char frame_expr[65536];
+    build_bal_expr(frame_expr, sizeof(frame_expr), starts, 0, n_shots - 1);
+    free(starts);
+    printf("Force key frames @ abs frame ids (no fps)\n");
 
-    for (int i = 1; i < n_shots; i++) {  /* skip shot 0 (starts at 0) */
-        double t = shots[i].start / fps;
-        char buf[32];
-        int n = snprintf(buf, sizeof(buf), "%s%.6f", i > 1 ? "," : "", t);
-        if (ts_len + n < n_shots * 16) {
-            strcat(timestamps, buf);
-            ts_len += n;
-        }
+    /* segment_frames: 每段结束帧号（官方：到该帧号切分新段） */
+    size_t sf_len = 0;
+    char *sf = malloc((size_t)n_shots * 16);
+    if (!sf) { fprintf(stderr, "OOM\n"); return 1; }
+    sf[0] = '\0';
+    for (int i = 0; i < n_shots - 1; i++) {
+        int n = snprintf(sf + sf_len, (size_t)(n_shots * 16) - sf_len,
+                         "%s%d", i > 0 ? "," : "", shots[i].end);
+        if (n > 0) sf_len += (size_t)n;
     }
-    printf("Timestamps: %d chars\n", ts_len);
 
-    /* ── Single ffmpeg: one decode, one encode, segment muxer splits ── */
     char cmd[32768];
     char out_pattern[4096];
     snprintf(out_pattern, sizeof(out_pattern), "%s/segment_%%04d.mp4", out_dir);
@@ -133,16 +137,15 @@ int main(int argc, char *argv[]) {
         "ffmpeg -y -v error "
         "-hwaccel cuda -hwaccel_output_format cuda "
         "-i '%s' "
-        "-force_key_frames %s "
+        "-force_key_frames 'expr:%s' "
         "-c:v h264_nvenc -preset p1 -cq 26 -forced-idr 1 "
-        "-an "
-        "-f segment -segment_times %s -reset_timestamps 1 "
+        "-f segment -segment_frames %s -reset_timestamps 1 "
         "'%s'",
-        video_path, timestamps, timestamps, out_pattern);
+        video_path, frame_expr, sf, out_pattern);
 
     printf("Encoding...\n");
     int ret = system(cmd);
-    free(timestamps);
+    free(sf);
 
     if (ret != 0) {
         fprintf(stderr, "ffmpeg failed (exit %d)\n", ret);
