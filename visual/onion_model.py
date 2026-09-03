@@ -18,9 +18,7 @@ PERSON_SCENE_OFFSET 环境变量把全局号映射回本视频本地号（照 gr
 import json, os, sys
 from collections import defaultdict
 
-PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OUTPUT_DIR = os.path.join(PROJECT_DIR, "output")
-OUT_ROOT = os.environ.get("OUT_ROOT")
+OUT_ROOT = os.environ["OUT_ROOT"]   # 必须由 shikoto 设置，禁止单跑、禁止回退
 
 # project_mode: mode_b, project_name, vid_name（照 face_recognition.py 模式）
 _mode_b = False
@@ -43,15 +41,8 @@ def main():
     _project_name = project_name
     _vid_name = vid_name
 
-    if OUT_ROOT:
-        visual_dir = os.path.join(OUT_ROOT, "visual")
-        sfx = f"_{vid_name}"
-    elif mode_b:
-        visual_dir = os.path.join(OUTPUT_DIR, project_name, "visual")
-        sfx = f"_{vid_name}"
-    else:
-        visual_dir = os.path.join(OUTPUT_DIR, video_name, "visual")
-        sfx = f"_{vid_name}"
+    visual_dir = os.path.join(OUT_ROOT, "visual")
+    sfx = f"_{vid_name}"
     sk_path = os.path.join(visual_dir, "dedup", f"{vid_name}_skeleton.json")
     if not os.path.isfile(sk_path):
         sk_path = os.path.join(visual_dir, "dino", f"{vid_name}_skeleton.json")
@@ -144,10 +135,10 @@ def main():
 
 
 def _make_scene(sa, sb, scenes, shots, persons, fps):
-    """sa..sb 为 dedup scene 下标范围。shot_range / shot_frame / asr 由组成 scene 聚合。"""
+    """sa..sb 为 dedup scene 下标范围。frames_range / shot_frame / asr 由组成 scene 聚合。"""
     seg = scenes[sa:sb + 1]
-    sf = shots[scenes[sa]["shot_range"]["start"]]["range"]["start"]
-    ef = shots[scenes[sb]["shot_range"]["end"]]["range"]["end"]
+    sf = scenes[sa]["frames_range"]["start"]
+    ef = scenes[sb]["frames_range"]["end"]
     shot_frame = {}
     frames = []
     asr = []
@@ -158,13 +149,12 @@ def _make_scene(sa, sb, scenes, shots, persons, fps):
     return {
         "id": -1,  # _write 重新编号
         "scene_range": {"start": sa, "end": sb},
-        "shot_range": {"start": scenes[sa]["shot_range"]["start"], "end": scenes[sb]["shot_range"]["end"]},
+        "frames_range": {"start": scenes[sa]["frames_range"]["start"], "end": scenes[sb]["frames_range"]["end"]},
         "shot_frame": shot_frame,
         "frames": frames,
         "asr": asr,
         "n_scenes": sb - sa + 1,
-        "range": {"start": sf, "end": ef},
-        "duration_s": round((ef - sf + 1) / fps, 1),
+        "duration_s": round((ef - sf + 1) / fps, 1),   # 2026-09-02：范围一律 frames_range，range 字段已删
         "persons": sorted(persons),
     }
 
@@ -179,12 +169,7 @@ def _emit_all_fragment(sk, scenes, shots, fps, video_name):
 def _write(sk, proto, video_name):
     for i, sc in enumerate(proto):
         sc["id"] = i
-    if OUT_ROOT:
-        out_dir = os.path.join(OUT_ROOT, "visual", "onion_model")
-    elif _mode_b:
-        out_dir = os.path.join(OUTPUT_DIR, _project_name, "visual", "onion_model")
-    else:
-        out_dir = os.path.join(OUTPUT_DIR, video_name, "visual", "onion_model")
+    out_dir = os.path.join(OUT_ROOT, "visual", "onion_model")
     out_path = os.path.join(out_dir, f"{_vid_name}_skeleton.json")
     os.makedirs(out_dir, exist_ok=True)
     with open(out_path, "w") as f:

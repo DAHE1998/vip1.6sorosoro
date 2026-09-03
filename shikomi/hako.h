@@ -16,6 +16,18 @@ typedef struct {
     uint32_t size;
 } MOVSample;
 
+/* 视频轨编码类型（容器无关；NVDEC 可硬解集合见 kaiseki 映射） */
+typedef enum {
+    HAKO_CODEC_UNKNOWN = 0,
+    HAKO_CODEC_H264,
+    HAKO_CODEC_HEVC,
+    HAKO_CODEC_AV1,
+    HAKO_CODEC_VP9,
+    HAKO_CODEC_VP8,
+    HAKO_CODEC_MPEG2,
+    HAKO_CODEC_VC1,
+} HakoCodec;
+
 typedef struct {
     /* 文件/mmap 信息（libavformat 模式下 off/size/v 不再作为数据来源，仅兼容旧字段） */
     int          fd;
@@ -26,6 +38,7 @@ typedef struct {
     int64_t      m_duration;
 
     int          has_video;
+    HakoCodec    v_codec;      /* 视频轨编码（2026-09-01：多编码 NVDEC，不再 H264 专用） */
     uint32_t     width, height;
     uint32_t     v_timescale;
     int64_t      v_nb_frames;
@@ -65,6 +78,20 @@ typedef struct {
 int  annexb_open(AnnexB *ab, const uint8_t *avcc, int avcc_size);
 void annexb_close(AnnexB *ab);
 int  annexb_filter(AnnexB *ab, const uint8_t *in, int in_size, uint8_t **out, int *out_size);
+
+/* H.265 hvcC → annexb（参考自 FFmpeg 9.0 libavcodec/bsf/hevc_mp4toannexb.c）。
+ * 与 H264 版同构：length 前缀 NAL → startcode，首帧前补 hvcC 里的 VPS/SPS/PPS。 */
+typedef struct {
+    uint8_t *vps; int vps_size;
+    uint8_t *sps; int sps_size;
+    uint8_t *pps; int pps_size;
+    int length_size;
+    int vps_seen, sps_seen, pps_seen, extradata_parsed;
+} HevcAnnexB;
+
+int  hevc_annexb_open(HevcAnnexB *hb, const uint8_t *hvcC, int hvcC_size);
+void hevc_annexb_close(HevcAnnexB *hb);
+int  hevc_annexb_filter(HevcAnnexB *hb, const uint8_t *in, int in_size, uint8_t **out, int *out_size);
 
 #ifdef __cplusplus
 }

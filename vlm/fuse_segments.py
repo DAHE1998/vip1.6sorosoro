@@ -34,6 +34,7 @@
 import argparse
 import glob
 import json
+import os
 import sys
 import time
 from dataclasses import dataclass, field
@@ -45,6 +46,11 @@ import torch
 import torchvision.io as tio
 
 BASE = Path(__file__).resolve().parent.parent
+
+
+def resolve_out(video_dir):
+    """输出根定位：OUT_ROOT 必须由 shikoto 设置，禁止单跑、禁止回退（2026-09-01 大名）。"""
+    return Path(os.environ["OUT_ROOT"])
 
 # RIB_CFG 定稿（2026-08-17，novelize.py 逐字一致；max_frames=0 为 2026-08-18 大名补订：
 # 一段所有帧拼一张横向长条，DINO 视觉跳变/黑帧边界画黑线隔开，禁按 run 拆子图）
@@ -274,45 +280,12 @@ class Transition:
     overlap_frac: float = None
 
 
-def plan_pair(fid_a, fid_b, frameA, frameB, impA, impB, xA, cfg, merge_mode="asr"):
-    """frameA/B: H×W×3 float32 BGR；impA/B: H×W 重要度；xA: A 在 canvas x → Transition。
-    2026-08-17 大名：max_overlap=0.0 定稿 = 纯硬切——无溶解、无 seam、无动态 overlap。"""
-    W = frameA.shape[1]
-    ov_frac = 0.0 if (cfg.asr_split and merge_mode == "split") else cfg.max_overlap
-    ov = int(round(W * ov_frac))
-    band_start_x = xA + W - ov
-    seam_x = band_start_x + ov / 2.0
-    return Transition(fid_a, fid_b, ov, ov, band_start_x, band_start_x + ov,
-                      seam_x, ov_frac)
-
-
-# ═══════════════════════════════════ 融合核心（内联 ribbon.py，GPU 化，禁兜底）═══════════════════════════════════
-@dataclass
 class Layer:
     frame_id: int
     scene_id: int
     x: float
     width: int
     effective_width: int
-
-
-def load_frames(specs, cfg):
-    """FrameSpec 列表 → (frames BGR float32 HWC CUDA, scale)。GPU 解码 + GPU 驻留（零往返）。"""
-    ts = _decode_gpu_batch([sp.path for sp in specs])     # (N,H,W,3) uint8 CUDA BGR
-    if not cfg.width:
-        cfg.width = ts.shape[2]
-    return [f.to(torch.float32) for f in ts], 1.0
-
-
-def _scaled_faces(sp, scale, cfg):
-    """人脸 bbox 缩放到 ribbon 像素并 clip"""
-    out = []
-    for f in sp.faces:
-        out.append(FaceBox(
-            x1=max(0.0, f.x1 * scale), y1=max(0.0, f.y1 * scale),
-            x2=min(cfg.width, f.x2 * scale), y2=min(cfg.height, f.y2 * scale),
-            det_score=f.det_score))
-    return out
 
 
 def _main_subject_bodies(bodies, cfg):
@@ -332,24 +305,6 @@ def _main_subject_bodies(bodies, cfg):
         keep = {i for _, i in hs[cut + 1:]}
         return [b for idx, b in enumerate(bodies) if idx in keep]
     return bodies
-
-
-def _scaled_bodies(sp, scale, cfg, frame_h=None):
-    """YOLO body bbox（原始像素）缩放 + 小人物过滤 + 主体分群。frame_h 用实际帧高。"""
-    ref_h = frame_h if frame_h else cfg.height
-    if scale == 1.0:
-        out = []
-        for (x1, y1, x2, y2) in sp.bodies:
-            if (y2 - y1) >= ref_h * cfg.min_body_ratio:
-                out.append((x1, y1, x2, y2))
-        return tuple(_main_subject_bodies(out, cfg))
-    out = []
-    for (x1, y1, x2, y2) in sp.bodies:
-        if (y2 - y1) * scale < ref_h * cfg.min_body_ratio:
-            continue
-        out.append((max(0.0, x1 * scale), max(0.0, y1 * scale),
-                    min(cfg.width, x2 * scale), min(cfg.height, y2 * scale)))
-    return tuple(_main_subject_bodies(out, cfg))
 
 
 def _body_cols_force(H, W, bodies) -> torch.Tensor:
@@ -440,21 +395,6 @@ def compress_cold(frame, imp, a, lock_cols=None, bg_only=True, bg_frac=0.25, min
     return fr, im, (cum, target)
 
 
-def _segment_meta(specs, layers, frames, run_of):
-    """区段元数据：连续同 has_asr 的帧组；x0/x1 = 区段在整条 ribbon 的裁切范围"""
-    out = []
-    for rid in sorted(set(run_of)):
-        idxs = [i for i, r in enumerate(run_of) if r == rid]
-        x0 = layers[idxs[0]].x
-        x1 = layers[idxs[-1]].x + frames[idxs[-1]].shape[1]
-        out.append({
-            "id": rid, "has_asr": specs[idxs[0]].has_asr,
-            "frames": [sp.frame_id for sp in [specs[i] for i in idxs]],
-            "x0": x0, "x1": x1, "width": int(round(x1 - x0)),
-        })
-    return out
-
-
 def _mark_frame_label(img: np.ndarray, label: str, cx: int = None) -> np.ndarray:
     """把画面序号标在图宽左 1/4 处（黑底包数字，防 VLM 当长条全景）。cx = 整条 canvas 绝对 x
     （多帧段延后到输出端一次画，2026-08-21 大名：全 GPU 数据流，cv2 只在输出端回 CPU）；
@@ -477,151 +417,12 @@ def _mark_frame_label(img: np.ndarray, label: str, cx: int = None) -> np.ndarray
     return fr
 
 
-def _draw_frame_index(img: np.ndarray, x0: float, layers, transitions=()) -> np.ndarray:
-    """连环画分格线：黑线画在每对帧融合带中心（ov=0 硬切=帧边界分格标记）。
-    缝宽相对图宽（不硬编码像素）；cv2/numpy 写前强制连续可写 uint8。"""
-    if img.dtype != np.uint8 or not img.flags.writeable or not img.flags.c_contiguous:
-        img = np.clip(img, 0, 255).astype(np.uint8)
-        if not img.flags.writeable:
-            img = img.copy()
-    h, w = img.shape[:2]
-    half = max(1, w // 200)   # 分格线半宽相对图宽（2026-08-18 大名：继续加粗；3000 宽 → 15px）
-    seams = []
-    for t in transitions:
-        cx = (t.band_start_x + t.band_end_x) / 2.0
-        if x0 <= cx < x0 + w:
-            lo = max(t.band_start_x, cx - half)
-            hi = min(t.band_end_x, cx + half)
-            if hi - lo < 2 * half:
-                lo, hi = cx - half, cx + half
-            seams.append((cx - x0, lo - x0, hi - x0))
-    for s, lo, hi in seams:
-        a, b = max(0, int(round(lo))), min(w, int(round(hi)))
-        img[:, a:b] = (16, 16, 16)
-    return img
-
-
-def rasterize(layers, frames, cfg, transitions) -> torch.Tensor:
-    """一次性分层合成（GPU，零往返）：每帧完整铺 canvas[:, x:x+w] = frame
-    （max_overlap=0 纯硬切，无溶解）。返回 GPU canvas (H,W,3) float32 BGR。"""
-    H = cfg.height
-    xs = [l.x for l in layers]
-    widths = [fr.shape[1] for fr in frames]
-    canvas_w = int(round(xs[-1])) + widths[-1]
-    torch = _torch()
-    canvas = torch.zeros((H, canvas_w, 3), dtype=torch.float32, device=torch.device("cuda"))
-    for i, fr in enumerate(frames):
-        x = int(round(xs[i]))
-        w = widths[i]
-        canvas[:, x:x + w] = fr
-    return canvas
-
-
-def _finalize_canvas(canvas, layers, frames, transitions) -> np.ndarray:
-    """GPU canvas (H,W,3) float32 BGR → (H,W,3) uint8 BGR numpy：输出端唯一一次 CPU
-    （cv2 画分格线 + 各帧序号，2026-08-21 大名：帧全程留 GPU，文字只在输出端一次回 CPU）。"""
-    torch = _torch()
-    out = canvas.clamp(0, 255).to(torch.uint8).cpu().numpy()
-    out = _draw_frame_index(out, 0, layers, transitions)
-    for i, (l, fr) in enumerate(zip(layers, frames)):
-        out = _mark_frame_label(out, str(i + 1), cx=int(round(l.x)) + int(fr.shape[1]) // 4)
-    return out
-
-
-def build_ribbon(specs, cfg, out_dir, tag=None, dino=None):
-    """端到端：加载 → 重要度(+face) → 冷区压缩 → 每对 plan → 分层 rasterize → 写 jpg+json。
-    dino: DinoIndex 预构造（一次加载，禁每段重载）。返回 (jpg, meta, layers, transitions, imps)。"""
-    tag = tag or "ribbon"
-    frames, scale = load_frames(specs, cfg)
-
-    # 段内不再按 DINO 切 run（2026-08-18 大名定稿：切 seg 在选帧阶段按相邻差距过大
-    # 完成，融合端一个 seg 一组帧直接拼一张图，禁段内黑线分 N 段）
-    imps = []
-    frames_c = []
-    W_full = cfg.width
-    for i, (sp, fr) in enumerate(zip(specs, frames)):
-        faces = _scaled_faces(sp, scale, cfg) if cfg.face_protect else ()
-        imp = _importance_with_faces(fr, faces, cfg)
-        sb = _scaled_bodies(sp, scale, cfg, frame_h=fr.shape[0]) if sp.bodies else ()
-        lock = None
-        if faces:
-            lock = _face_cols_force(fr.shape[0], fr.shape[1], faces).any(axis=0)
-        if cfg.body_lock and sb:
-            b = _body_cols_force(fr.shape[0], fr.shape[1], sb).any(axis=0)
-            lock = b if lock is None else torch.logical_or(lock, b)
-        cc = (cfg.compress_cold_weight_asr if sp.has_asr
-              else cfg.compress_cold_weight_no_asr) if cfg.asr_split else cfg.compress_cold_weight
-        has_subject = bool(faces) or bool(sb)
-        min_frac = 0.0 if has_subject else 0.55
-        fr, imp, (cum, target) = compress_cold(fr, imp, cc, lock,
-                                               cfg.compress_bg_only, cfg.compress_bg_frac,
-                                               min_frac, out_h=cfg.height)
-        # 打标延后到整条 canvas 最后一次 CPU（2026-08-21 大名：全 GPU 数据流，帧留 GPU，
-        # cv2 文字只在输出端一次画；序号 1 2 3 按序，段内全部帧连续标号）
-        frames_c.append(fr)
-        imps.append(imp)
-    frames = frames_c
-
-    def _merge_mode(i):
-        return "asr" if (specs[i].has_asr and specs[i + 1].has_asr) else "no_asr"
-
-    xs = [0.0]
-    for i in range(len(specs) - 1):
-        t = plan_pair(specs[i].frame_id, specs[i + 1].frame_id,
-                      frames[i], frames[i + 1], imps[i], imps[i + 1], xs[i], cfg,
-                      merge_mode=_merge_mode(i))
-        xs.append(xs[i] + frames[i].shape[1] - t.overlap_px)
-
-    layers = [Layer(frame_id=sp.frame_id, scene_id=sp.scene_id, x=x, width=cfg.width,
-                    effective_width=fr.shape[1])
-              for sp, x, fr in zip(specs, xs, frames)]
-
-    canvas_w = int(round(xs[-1])) + frames[-1].shape[1]
-    transitions = []
-    for i in range(len(specs) - 1):
-        t = plan_pair(specs[i].frame_id, specs[i + 1].frame_id,
-                      frames[i], frames[i + 1], imps[i], imps[i + 1], xs[i], cfg,
-                      merge_mode=_merge_mode(i))
-        transitions.append(t)
-
-    ribbon = _finalize_canvas(rasterize(layers, frames, cfg, transitions),
-                              layers, frames, transitions)   # GPU 合成 → 输出端一次性 CPU
-
-    meta = {
-        "ribbon_id": tag, "video": specs[0].path, "height": cfg.height, "width": canvas_w,
-        "config": {"max_overlap": cfg.max_overlap, "curve": cfg.curve,
-                   "face_protect": cfg.face_protect, "seam_mode": cfg.seam_mode,
-                   "dynamic_overlap": cfg.dynamic_overlap, "asr_split": cfg.asr_split,
-                   "min_dino_merge": cfg.min_dino_merge},
-        "layers": [{"frame_id": l.frame_id, "scene_id": l.scene_id, "x": l.x,
-                    "width": l.width, "effective_width": l.effective_width,
-                    "has_asr": sp.has_asr, "black_before": sp.black_before,
-                    "segment": 0}
-                   for i, (l, sp) in enumerate(zip(layers, specs))],
-        "transitions": [{"from_frame": t.from_frame, "to_frame": t.to_frame,
-                         "overlap_px": t.overlap_px,
-                         "transition_width_px": t.transition_width_px,
-                         "seam_x": t.seam_x} for t in transitions],
-        "segments": _segment_meta(specs, layers, frames, [0] * len(specs)),
-    }
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    jpg = out_dir / f"{tag}.jpg"
-    cv2.imwrite(str(jpg), ribbon, [cv2.IMWRITE_JPEG_QUALITY, 92])
-    # 2026-08-18 大名：段图 meta json（layers/transitions）无人消费，不再落盘
-
-    # 一个 seg 一张图（2026-08-18 大名：选帧已按相邻差距过大切 seg，融合端一个 seg
-    # 一组帧拼一张图，禁段内黑线分 N 段）。meta["segments"] 为整段单一元数据。
-    return jpg, meta, layers, transitions, imps
-
-
-# ═══════════════════════════════════ 上游读入（只读产物，不二次计算）═══════════════════════════════════
 def load_skeleton(video_dir, ep=None):
     """读选帧骨架 output/<项目>/vlm/*_skeleton.json（select 落盘；2026-08-18 大名定稿：
     output/<项目名字>/vlm/<选帧骨架>.json，不再读 visual/dedup）。--ep 过滤 + 唯一性选集；
     prefix = 骨架 video_hash（帧前缀内容指纹）"""
-    out = BASE / "output" / video_dir
-    skels = glob.glob(str(out / "vlm" / "*_skeleton.json"))
+    out = resolve_out(video_dir)
+    skels = sorted((out / "vlm").glob("*_skeleton.json"))   # Path.glob：锚点路径字面，方括号文件夹名不当通配符
     picks = []
     for p in skels:
         sk = json.load(open(p))
@@ -688,36 +489,6 @@ def _check_hash(d, label, sk):
                          f"{sk['video_hash']}（跨模块哈希不一致，禁止融合）")
 
 
-def specs_for(frames, scene_of, sk, out, face_idx, prefix, dialogue=None, body_bbox=None):
-    """frames 序帧号 → FrameSpec 列表（黑帧剔除；faces/bodies/has_asr 只读上游）。
-    scenes 为选帧骨架结构 {id, frame}（2026-08-19：每 scene 一个计算源帧）"""
-    black = {s["frame"] for s in sk["scenes"]
-             if s.get("black") and s.get("frame") is not None}
-    specs = []
-    prev_fn = None
-    for fn in frames:
-        if fn in black:
-            continue
-        sid = scene_of.get(fn)
-        if sid is None:
-            raise SystemExit(f"❌ 帧 {fn} 不在骨架 scenes（选帧产物与骨架不一致，禁止融合）")
-        has_asr = False
-        if dialogue:
-            # 2026-08-19 大名：台词按 scene 聚合，帧所在 scene 有台词即 has_asr（不精确到帧）
-            has_asr = bool(dialogue.get(sid))
-        specs.append(FrameSpec(
-            frame_id=fn, scene_id=sid,
-            path=str(out / "shikomi/frames" / f"{prefix}_f{fn}.jpg"),
-            ts=fn / sk["fps"],
-            faces=(face_idx[fn],) if face_idx.get(fn) else (),
-            bodies=tuple(tuple(b[:4]) for b in body_bbox.get(f"{prefix}_f{fn}", ())),
-            has_asr=has_asr,
-            black_before=(prev_fn is not None and any(prev_fn < b < fn for b in black)),
-        ))
-        prev_fn = fn
-    return specs
-
-
 def _body(out, sk):
     """YOLO 身体 bbox（body_detect 全局产物 body_bbox.json，必出；键 = gc 同款帧标记
     <hash>_f<fn>，2026-08-21 大名：身体骨架每项目全局一份，下游拿帧名直接查）"""
@@ -726,8 +497,12 @@ def _body(out, sk):
     if not p.exists():
         raise SystemExit(f"❌ 无 body_bbox {vh}: {out / 'visual/body_detect'}（上游 body_detect 未跑）")
     d = json.load(open(p, encoding="utf-8"))
-    if not any(k.startswith(f"{vh}_f") for k in d):
-        raise SystemExit(f"❌ body_bbox 缺 {vh} 帧（上游 body_detect 未含本视频，或跑错项目）")
+    # 2026-09-02 修：body_bbox 可合法为空（无人物视频检测不到任何 frame key），
+    # single_img 空 bodies 照常出图。仅当 body_detect 根本没覆盖本视频才报错（按 videos 列表判断）
+    covered = any(isinstance(v, dict) and (v.get("video_hash") == vh or v.get("video_id") == vh)
+                  for v in d.get("videos", []))
+    if not covered:
+        raise SystemExit(f"❌ body_bbox 未覆盖 {vh}（上游 body_detect 未含本视频，或跑错项目）")
     return d
 
 
@@ -752,7 +527,7 @@ def frame_no(fn):
 
 def _is_key_frame(fn):
     """帧名后缀含 key（_key / _c{id}key，2026-08-21 大名：与 submit _is_key 同判定）；
-    簇成员 _c{id} 无 key 后缀。纯簇成员段（段内无 key 帧）不拼图，簇复用省送检。"""
+    簇成员 _c{id} 无 key 后缀。纯簇成员段（段内无 key 帧）不出图，簇复用省送检。"""
     return fn.rsplit("_", 1)[-1].endswith("key")
 
 
@@ -767,9 +542,10 @@ def compute_clusters(segments, dino, thr=CLUSTER_THR):
     raise SystemExit("❌ 簇计算已前移 select_segments，fuse 只读帧名后缀（_key/_c{id}key）")
 
 
-def single_img(seg, fn, face_idx, body_bbox, prefix, out_dir):
-    """单帧段出图（2026-08-17 定稿）：读帧→检测→锁主体列→压背景→统一缩 cfg.height→
-    压缩完打标（左1/4）。无人帧压 3:4 竖版；有人帧压背景锁主体列。"""
+def single_img(seg, fn, face_idx, body_bbox, prefix, out_dir, out_name=None):
+    """逐帧出图（2026-08-17 定稿单帧逻辑；2026-08-30 大名：多帧段逐帧调用）：读帧→检测→
+    锁主体列→压背景→统一缩 cfg.height→压缩完打标（左1/4）。无人帧压 3:4 竖版；有人帧压背景锁主体列。
+    out_name：输出文件名（None 时 = {seg['seg']}.jpg；多帧段传 {seg}{n}.jpg 逐帧）。"""
     frame = _read_frame_bgr(out_dir.parent.parent / "shikomi/frames" / f"{prefix}_f{fn}.jpg")
     faces = (face_idx[fn],) if face_idx.get(fn) is not None else ()
     cfg = RibbonConfig(**RIB_CFG)
@@ -783,7 +559,7 @@ def single_img(seg, fn, face_idx, body_bbox, prefix, out_dir):
         min_frac = 0.75 * frame.shape[0] / frame.shape[1]
         fr, _, _ = compress_cold(frame, imp, 0.2, None, True, 0.25, min_frac,
                                  out_h=cfg.height)
-        img = f"{seg['seg']}.jpg"
+        img = out_name or f"{seg['seg']}.jpg"
     else:
         imp = _importance_with_faces(frame, faces, cfg)
         lock = None
@@ -796,7 +572,7 @@ def single_img(seg, fn, face_idx, body_bbox, prefix, out_dir):
               else cfg.compress_cold_weight_no_asr) if cfg.asr_split else cfg.compress_cold_weight
         fr, _, _ = compress_cold(frame, imp, cc, lock, cfg.compress_bg_only,
                                  cfg.compress_bg_frac, 0.0, out_h=cfg.height)
-        img = f"{seg['seg']}.jpg"
+        img = out_name or f"{seg['seg']}.jpg"
     fr = _mark_frame_label(fr.clamp(0, 255).to(torch.uint8).cpu().numpy(), "1")
     p = out_dir / img
     if not p.exists():
@@ -805,25 +581,27 @@ def single_img(seg, fn, face_idx, body_bbox, prefix, out_dir):
 
 
 def _process_seg(job, ctx):
-    """阶段2 串行 worker：单段融合。job = (kind, seg, fns, tag, specs)。
-    specs 在 main 一次算好传入（不二次计算）。共享数据从 ctx 读（单进程串行）。"""
+    """阶段2 串行 worker：逐帧出图。job = (kind, seg, fns, tag, specs)。
+    specs 在 main 一次算好传入（不二次计算）。共享数据从 ctx 读（单进程串行）。
+    2026-08-30 大名：删拼图，多帧段逐帧出图 {seg}{n}.jpg（n = 帧号在 fns 的序号）。"""
     kind, seg, fns, tag, specs = job
     # 无 try/except 兜底（2026-08-18 大名：出错直接抛，脚本即停，禁吞错误继续跑）
-    if kind == "single":
+    if len(fns) < 2:
         img, sub, has_subject = single_img(seg, fns[0], ctx["face_idx"], ctx["body_bbox"],
                                            ctx["prefix"], ctx["out_dir"])
         return "single", (seg["seg"], img, sub, has_subject)
-    if len(specs) < 2:
-        img, sub, has_subject = single_img(seg, fns[0], ctx["face_idx"], ctx["body_bbox"],
-                                           ctx["prefix"], ctx["out_dir"])
-        return "single", (seg["seg"], img, sub, has_subject)
-    build_ribbon(specs, RibbonConfig(**RIB_CFG), ctx["out_dir"], tag, dino=ctx["dino"])
-    subs = [tag]   # 一个 seg 一张图（2026-08-18 大名：选帧已切 seg，融合一张图/seg）
-    return "multi", (seg["seg"], len(fns), "", subs)
+    # 多帧段：逐帧 single_img，命名 {seg}{n}.jpg（原在帧内序号）
+    imgs = []
+    for n, fn in enumerate(fns):
+        out_name = f"{seg['seg']}{n}.jpg"
+        img, sub, has_subject = single_img(seg, fn, ctx["face_idx"], ctx["body_bbox"],
+                                           ctx["prefix"], ctx["out_dir"], out_name=out_name)
+        imgs.append(img)
+    return "multi", (seg["seg"], len(fns), "", imgs)
 
 
 def main():
-    """主流程：读选帧骨架 → 划拼图清单（纯簇成员段跳过）→ 逐段融合 → 落验收页 + 融合骨架"""
+    """主流程：读选帧骨架 → 划出图清单（纯簇成员段跳过）→ 逐帧出图 → 落验收页。"""
     ap = argparse.ArgumentParser()
     ap.add_argument("video_dir")
     ap.add_argument("--ep", default=None)
@@ -833,13 +611,8 @@ def main():
     fps = sk["fps"]
 
     segments = sk["segments"]                         # 选帧骨架 segments 键（段来源）
-    dino = DinoIndex.from_out(out, prefix)            # 一次构造（禁每段重载）
-
-    scene_of = {s["frame"]: s["id"] for s in sk["scenes"]
-                if s.get("frame") is not None}
     face_idx = load_face_index(sk, out)
     body_bbox = _body(out, sk)
-    dialogue = load_dialogue(out, sk)
     out_dir = out / "vlm" / "segments"                # 融合图片文件夹（大名 2026-08-18 定稿）
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -854,54 +627,30 @@ def main():
 
     print(f"[fuse] {name}: {len(segments)} 段（选帧产物），fps={fps}", flush=True)
 
-    # ── 拼图清单：select 已选好每段帧（帧名带簇标记，2026-08-21 大名），fuse 直接拼 ──
+    # ── 出图清单：select 已选好每段帧（帧名带簇标记，2026-08-21 大名），fuse 逐帧出图 ──
     jobs = []
-    fused_rows = []                 # 融合骨架行（大名 2026-08-18：段图清单）
-    n_skip_cluster = 0              # 纯簇成员段（簇复用省送检，不拼图）
+    n_skip_cluster = 0              # 纯簇成员段（簇复用省送检，不出图）
     for seg in segments:
         # 纯簇成员段：段内无 key 帧（全 _c{id} 簇成员，簇 rep 已在上游标好，submit 复用
-        # desc 不送检）→ 不拼图，fused.json 记录（2026-08-21 大名：跳过不拼但记录好）
+        # desc 不送检）→ 不出图（2026-08-21 大名：跳过不拼但记录好）
         if seg["frames"] and not any(_is_key_frame(f) for f in seg["frames"]):
-            fused_rows.append({"seg": seg["seg"], "seg_id": seg["seg_id"],
-                               "img": None, "fuse_frames": 0,
-                               "order": [],   # 无段图，无格子序
-                               "type": "簇成员段", "skipped": True})
             n_skip_cluster += 1
             continue
-        # 段图只拼 key 帧（2026-08-21 大名：簇共享帧 _c{id} 不送检，共享 rep desc）。
-        # 格序 = key 帧名序，order 记录 编号→帧名，VLM 编号按此回写。
+        # 只出 key 帧图（2026-08-21 大名：簇共享帧 _c{id} 不送检，共享 rep desc）。
         keys = [f for f in seg["frames"] if _is_key_frame(f)]
         fns = [frame_no(f) for f in keys]
         if len(fns) < 2:
             jobs.append(("single", seg, fns, None, None))
-            fused_rows.append({"seg": seg["seg"], "seg_id": seg["seg_id"],
-                               "img": f"{seg['seg']}.jpg", "fuse_frames": 1,
-                               "order": keys,   # 格子序 = key 帧名序（编号→帧名映射）
-                               "type": "单帧", "skipped": False})
             continue
         tag = seg_tag(prefix, seg)
-        specs = specs_for(fns, scene_of, sk, out, face_idx, prefix, dialogue, body_bbox=body_bbox)
-        if len(specs) < 2:
-            jobs.append(("single", seg, fns, None, None))
-            fused_rows.append({"seg": seg["seg"], "seg_id": seg["seg_id"],
-                               "img": f"{seg['seg']}.jpg", "fuse_frames": 1,
-                               "order": keys,   # 格子序 = key 帧名序（编号→帧名映射）
-                               "type": "单帧", "skipped": False})
-            continue
-        jobs.append(("multi", seg, fns, tag, specs))
-        fused_rows.append({"seg": seg["seg"], "seg_id": seg["seg_id"],
-                           "img": f"{seg['seg']}.jpg", "fuse_frames": len(fns),
-                           "order": keys,   # 格子序 = key 帧名序（编号→帧名映射）
-                           "type": "多帧", "skipped": False})
-    print(f"✔ 拼图清单: 段 {len(segments)} → 拼 {len(jobs)}（单帧段 "
+        jobs.append(("multi", seg, fns, tag, None))
+    print(f"✔ 出图清单: 段 {len(segments)} → 出图 {len(jobs)}（单帧段 "
           f"{sum(1 for j in jobs if j[0] == 'single')}，纯簇成员跳过 {n_skip_cluster}）",
           flush=True)
 
     # ══ 逐段融合（串行，GPU 像素计算，无多进程无 fork）══
-    ctx = dict(face_idx=face_idx, body_bbox=body_bbox, prefix=prefix,
-               out_dir=out_dir, out=out, scene_of=scene_of, sk=sk,
-               dialogue=dialogue, dino=dino)
-    del face_idx, body_bbox, scene_of, dialogue
+    ctx = dict(face_idx=face_idx, body_bbox=body_bbox, prefix=prefix, out_dir=out_dir)
+    del face_idx, body_bbox
     n_built = n_skip = 0
     rows, single_rows = [], []
     t_all = time.time()
@@ -942,18 +691,9 @@ def main():
             + rows_html + f"<h2>单帧段（{len(single_rows)}）</h2>" + single_html
             + "</body></html>")
     (out_dir / "验收_帧融合_v3_自包含_全量.html").write_text(html, encoding="utf-8")
-    print(f"✔ {n_built} 张段图（{len(single_rows)} 单帧段）→ {out_dir}", flush=True)
+    print(f"✔ 出图 {n_built} 张（{len(single_rows)} 单帧段）→ {out_dir}", flush=True)
 
-    # ── 融合骨架：段图清单（大名 2026-08-18 定稿：vlm/ = 选帧骨架 + 融合图片文件夹
-    # + 融合骨架 + VLM描述；<prefix>_fused.json 落 vlm/）──
-    fused = {"video": sk["video"], "video_hash": sk["video_hash"], "prefix": prefix,
-             "img_dir": "vlm/segments/",
-             "segments": fused_rows,
-             "built": n_built, "single": len(single_rows),
-             "skipped": n_skip_cluster}
-    fused_path = out / "vlm" / f"{prefix}_fused.json"   # 标准名：<哈希>_<产物>.json（产物名英文，大名 2026-08-18）
-    fused_path.write_text(json.dumps(fused, ensure_ascii=False, indent=1), encoding="utf-8")
-    print(f"✔ 融合骨架: {fused_path}（{len(fused_rows)} 段清单）", flush=True)
+    # 骨架头：只落透传区 + 段图清单（2026-08-30 大名：fused.json 无人消费，删除）
     print(f"✔ 验收页: {out_dir / '验收_帧融合_v3_自包含_全量.html'}（总耗时 {time.time() - t_all:.0f}s）",
           flush=True)
 

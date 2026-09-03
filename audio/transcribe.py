@@ -26,6 +26,7 @@ from vllm import LLM, SamplingParams, TokensPrompt
 
 SR = 16000
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+OUT_ROOT = os.environ["OUT_ROOT"]   # 必须由 shikoto 设置，禁止单跑、禁止回退
 def _locate_model(env_names, *candidates):
     """模型目录定位：显式 env 优先 → HF_HOME 布局推导 → 报错提示（零硬编码，2026-08-07 铁律）"""
     import glob
@@ -33,7 +34,7 @@ def _locate_model(env_names, *candidates):
         v = os.environ.get(n)
         if v and os.path.isdir(v):
             return v
-    hf = os.environ.get("HF_HOME", "/models/hf")
+    hf = os.environ.get("HF_HOME") or sys.exit("[ERR] 未设置 HF_HOME(由 shikoto 注入 $MODELS_ROOT/hf)，禁止单跑用兜底 /models/hf")
     for c in candidates:
         if c.startswith("glob:"):
             m = glob.glob(c[5:].format(hf=hf))
@@ -178,32 +179,60 @@ def merge_by_speaker(results, shots=None, fps=None):
 
 
 def main():
-    """Qwen3-ASR 批量转录：读声纹段 → 整批喂 vllm → 切句插值 → 按说话人聚类。"""
+    """Qwen3-ASR 批量转录（2026-09-02 用户要求“只加载一次模型”）：
+    所有待转视频的 vh 一次性传入, vllm engine 只创建一次(LLM), 循环处理每个视频。
+    _transcribe_one(model, vh) 为单视频逻辑(原 main() 全函数体)。"""
     if len(sys.argv) < 2:
-        print(f"用法: {sys.argv[0]} <vn> [<project> <vid_name>]"); sys.exit(1)
+        print(f"用法: {sys.argv[0]} <vh|root:vh> [<vh|root:vh> ...]   (多个视频批量, engine 只加载一次)"); sys.exit(1)
+    # 每个参数 = vh（用环境 OUT_ROOT）或 root:vh（A 路线每视频独立产物根，2026-09-02 大名）
+    jobs = []
+    for it in sys.argv[1:]:
+        if ":" in it:
+            root, vh = it.rsplit(":", 1)
+        else:
+            root, vh = os.environ["OUT_ROOT"], it
+        jobs.append((root, vh))
 
-    vn = sys.argv[1]
-    mode_b = (len(sys.argv) == 4)
-    project_name = sys.argv[2] if mode_b else None
-    vid_name = sys.argv[3] if mode_b else vn
-    sfx = f"_{vid_name}"
+    # 一次加载 engine(模型仅一次)，所有视频共用。tmpdir 在 _transcribe_one 内每视频独立。
+    print(f"[transcribe] loading Qwen3-ASR-1.7B (vllm 0.27.1 原生) from {QWEN3_ASR_DIR}...", flush=True)
+    # 显存实测（2026-08-20 定稿，8G 卡可跑）：util=0.50 + max_num_batched_tokens=2048
+    # + seq=64 → 峰值 6799 MiB（省 43%，12288 上曾 11869）；核心是 max_num_batched_tokens
+    # 决定 encoder cache budget（默认 8192，压 2048 后 profiling 需求降 4 倍，util 才能压到 0.50）。
+    # enforce_eager 免 cudagraph/torch.compile 工作区（省内存）。全部 env 可调。
+    model = LLM(
+        model=QWEN3_ASR_DIR,
+        gpu_memory_utilization=float(os.environ.get("ASR_GPU_UTIL", "0.80")),
+        max_model_len=int(os.environ.get("ASR_MAX_MLEN", "8192")),
+        max_num_seqs=int(os.environ.get("ASR_MAX_SEQS", "64")),
+        max_num_batched_tokens=int(os.environ.get("ASR_MAX_BATCH_TOKENS", "4096")),
+        enforce_eager=(os.environ.get("ASR_EAGER", "1") == "1"),
+        allowed_local_media_path="/tmp",
+        disable_log_stats=True,
+    )
+    n_ok = 0
+    for root, vh in jobs:
+        os.environ["OUT_ROOT"] = root   # 每视频切自己的产物根（A 路线各视频独立文件夹）
+        print(f"\n[transcribe] ===== 视频 {vh} (root={root}) =====", flush=True)
+        if _transcribe_one(model, vh):
+            n_ok += 1
+    del model
+    print(f"[transcribe] 批量完成: {n_ok}/{len(jobs)} 视频转写成功", flush=True)
 
-    # 2026-08-14 修复：batch_pipeline 以 OUT_ROOT 调用，子脚本需与其布局一致（见 asr_pipeline.py）
-    OUT_ROOT = os.environ.get("OUT_ROOT")
-    if OUT_ROOT:
-        audio_base = os.path.join(OUT_ROOT, "audio")
-    elif mode_b:
-        audio_base = os.path.join(PROJECT_DIR, "output", project_name, "audio")
-    else:
-        audio_base = os.path.join(PROJECT_DIR, "output", vn, "audio")
-    wav_path   = os.path.join(audio_base, "wav", f"{vid_name}_audio.wav")
-    spk_path   = os.path.join(audio_base, "speaker", f"{vid_name}_speakers.json")
+
+def _transcribe_one(model, vh):
+    """单视频转录(原 main 逻辑，model 由 main() 传入，不再每次加载)：读声纹段 → 整批喂 vllm → 切句插值 → 按说话人聚类。"""
+
+    # 产物根一律 OUT_ROOT（shikoto 设置），禁止单跑、禁止回退
+    # main() 批量循环里逐视频切换 os.environ["OUT_ROOT"]（A 路线每视频独立产物根）
+    audio_base = os.path.join(os.environ["OUT_ROOT"], "audio")
+    wav_path   = os.path.join(audio_base, "wav", f"{vh}_audio.wav")
+    spk_path   = os.path.join(audio_base, "speaker", f"{vh}_speakers.json")
     out_dir    = os.path.join(audio_base, "transcribe")
     os.makedirs(out_dir, exist_ok=True)
 
     # 读 dedup 骨架的 shots（帧范围）→ 合并不跨 shot（2026-08-19 大名定稿）
     base_dir = os.path.dirname(audio_base)
-    skel_path = os.path.join(base_dir, "visual", "dedup", f"{vid_name}_skeleton.json")
+    skel_path = os.path.join(base_dir, "visual", "dedup", f"{vh}_skeleton.json")
     shots, fps = None, None
     if os.path.isfile(skel_path):
         skel = json.load(open(skel_path))
@@ -212,18 +241,38 @@ def main():
     else:
         print(f"[transcribe] 警告: 无 dedup 骨架 {skel_path}，合并不限制 shot", flush=True)
 
+    # 无音轨（wav 缺失）→ 写空 raw_segments，正常跳过，不视为异常（2026-09-01 大名）
+    if not os.path.isfile(wav_path):
+        print(f"[transcribe] 警告: 无音轨/未抽成 wav: {wav_path} → 写空 raw_segments（无毒）", flush=True)
+        with open(os.path.join(out_dir, f"{vh}_raw_segments.json"), "w") as f:
+            json.dump([], f, ensure_ascii=False)
+        return
+    # 无说话人（speakers.json 缺失=声纹未跑或崩）→ 明确报错退出非零，绝不静默当成功
+    if not os.path.isfile(spk_path):
+        print(f"[transcribe] 错误: 缺声纹 {spk_path}（先跑 tool_diarize），禁止静默跳过", flush=True)
+        sys.exit(1)
     spk_segs = json.load(open(spk_path))
+    if not spk_segs:
+        # 声纹空（真无说话人/静音）→ 空 raw_segments 属正常，不崩
+        print(f"[transcribe] 无说话人段（{spk_path} 为空）→ 写空 raw_segments（无毒）", flush=True)
+        with open(os.path.join(out_dir, f"{vh}_raw_segments.json"), "w") as f:
+            json.dump([], f, ensure_ascii=False)
+        return
     audio, sr = sf.read(wav_path)
     if sr != SR:
         import torchaudio.functional as AF
         audio = AF.resample(torch.tensor(audio).unsqueeze(0), sr, SR).squeeze().numpy()
 
-    required_model_files = ("config.json", "model.safetensors.index.json")
-    missing = [
-        name
-        for name in required_model_files
-        if not os.path.isfile(os.path.join(QWEN3_ASR_DIR, name))
-    ]
+    # 单文件权重（Qwen3-ASR-0.6B）无 index.json；多分片才有。config.json 必须，
+    # model.safetensors.index.json 或 单文件 model.safetensors 二者有其一即可。
+    required_model_files = ("config.json",)
+    missing = [name for name in required_model_files
+               if not os.path.isfile(os.path.join(QWEN3_ASR_DIR, name))]
+    if not missing:
+        _has_w = (os.path.isfile(os.path.join(QWEN3_ASR_DIR, "model.safetensors"))
+                  or os.path.isfile(os.path.join(QWEN3_ASR_DIR, "model.safetensors.index.json")))
+        if not _has_w:
+            missing.append("model.safetensors(.index.json)")
     if missing:
         print(
             f"[transcribe] Qwen3-ASR local model incomplete: "
@@ -231,24 +280,10 @@ def main():
         )
         sys.exit(1)
 
-    # 音频块临时目录（vllm audio_url 走 file://，allowed_local_media_path 限此目录）
+    # 音频块临时目录（vllm audio_url 走 file://，allowed_local_media_path="/tmp" 在 main() 已设）
+    # 本函数内每视频独立 tmpdir。
     tmpdir = tempfile.mkdtemp(prefix="qwen3asr_chunks_", dir="/tmp")
     try:
-        print(f"[transcribe] loading Qwen3-ASR-1.7B (vllm 0.27.1 原生) from {QWEN3_ASR_DIR}...")
-        # 显存实测（2026-08-20 定稿，8G 卡可跑）：util=0.50 + max_num_batched_tokens=2048
-        # + seq=64 → 峰值 6799 MiB（省 43%，12288 上曾 11869）；核心是 max_num_batched_tokens
-        # 决定 encoder cache budget（默认 8192，压 2048 后 profiling 需求降 4 倍，util 才能压到 0.50）。
-        # enforce_eager 免 cudagraph/torch.compile 工作区（省内存）。全部 env 可调。
-        model = LLM(
-            model=QWEN3_ASR_DIR,
-            gpu_memory_utilization=float(os.environ.get("ASR_GPU_UTIL", "0.80")),
-            max_model_len=int(os.environ.get("ASR_MAX_MLEN", "2048")),
-            max_num_seqs=int(os.environ.get("ASR_MAX_SEQS", "64")),
-            max_num_batched_tokens=int(os.environ.get("ASR_MAX_BATCH_TOKENS", "4096")),
-            enforce_eager=(os.environ.get("ASR_EAGER", "1") == "1"),
-            allowed_local_media_path=tmpdir,
-            disable_log_stats=True,
-        )
         print(f"[transcribe] {len(spk_segs)} speaker segments")
 
         t0 = time.time()
@@ -258,6 +293,10 @@ def main():
         # 相邻同 speaker 碎段先合并（270 段里多数 <1s），再整批送 vllm 连续批量。
         # 输出算法（切句/插值/lang/speaker）全部不动。
         MERGE_MAX_MS = 6000
+        # 2026-09-02 大名修复: vllm 0.27.1 Qwen3-ASR 编码器缓存固定 4096 embedding token，
+        # pyannote 把长语音合成单个 segment(如 e51ba9 达 345s)会超限抛 VLLMValidationError。
+        # 送 vllm 前把超长 chunk 按窗口切子段，逐段独立转写，时间戳按子段实际范围，不丢内容。
+        CHUNK_MAX_S = float(os.environ.get("ASR_CHUNK_MAX_S", "90"))  # 90s ≈ 3000 emb，留余量
         merged = []
         for seg in spk_segs:
             if (merged and merged[-1]["speaker"] == seg["speaker"]
@@ -275,7 +314,21 @@ def main():
             chunk = audio[int(ms0/1000*SR):int(ms1/1000*SR)]
             if len(chunk) < SR * 0.3:
                 continue
-            jobs.append((seg, chunk))
+            # 成篇采样+按段切分: 超长 segment 按窗口切成子段，每子段独立转写，
+            # 避免任何单段 embedding 超 vllm 编码器缓存 4096。
+            seg_dur_s = len(chunk) / float(SR)
+            if seg_dur_s > CHUNK_MAX_S:
+                n_cut = int(seg_dur_s // CHUNK_MAX_S) + (1 if seg_dur_s % CHUNK_MAX_S else 0)
+                print(f"[transcribe] 切长段: seg={ms0/1000:.1f}-{ms1/1000:.1f}s "
+                      f"dur={seg_dur_s:.1f}s > {CHUNK_MAX_S}s → 切 {n_cut} 子段", flush=True)
+                for k in range(n_cut):
+                    a0 = ms0 + int(k * CHUNK_MAX_S * 1000)
+                    a1 = min(ms0 + int((k + 1) * CHUNK_MAX_S * 1000), ms1)
+                    subseg = dict(seg); subseg["start_ms"] = a0; subseg["end_ms"] = a1
+                    subchunk = audio[int(a0/1000*SR):int(a1/1000*SR)]
+                    jobs.append((subseg, subchunk))
+            else:
+                jobs.append((seg, chunk))
         n_jobs = len(jobs)
         print(f"[transcribe] {n_jobs} 有效段 → vllm Qwen3-ASR 批量推理...", flush=True)
 
@@ -291,11 +344,28 @@ def main():
             for p in paths
         ]
         sp = SamplingParams(temperature=0.01, max_tokens=int(os.environ.get("ASR_MAX_TOKENS", "512")))
-        res_list = model.chat(convos, sampling_params=sp)
+        # 2026-09-02 大名修复: 某段 decoder prompt 超 max_model_len 时 vllm 抛
+        # VLLMValidationError 让整批一起废(一毒全毒)→ 回退逐段生成,仅跳过仍超长的段,
+        # 绝不因单段超长而把整视频转成空结果。max_model_len 2048→8192 给足余量。
+        try:
+            res_list = model.chat(convos, sampling_params=sp)
+        except Exception as _e:
+            print(f"[transcribe] 批量 vllm 失败({type(_e).__name__}: {str(_e)[:90]}) → 回退逐段生成", flush=True)
+            res_list = []
+            for _i, _seg in enumerate(jobs):
+                _ms0, _ms1 = _seg["start_ms"], _seg["end_ms"]
+                try:
+                    _r = model.chat([convos[_i]], sampling_params=sp)
+                    res_list.append(_r[0])
+                except Exception as _e2:
+                    print(f"[transcribe] 警告: 段{_i} ({_ms0/1000.0:.1f}s) 仍超 max_model_len，跳过该段（不毒整批）", flush=True)
+                    res_list.append(None)
         if len(res_list) != len(jobs):
             print(f"[transcribe] 警告: vllm 返回 {len(res_list)} != 输入 {len(jobs)}，截断对齐", flush=True)
 
         for i, ((seg, chunk), res) in enumerate(zip(jobs, res_list)):
+            if res is None:  # 逐段回退中被跳过的超长段
+                continue
             ms0, ms1 = seg["start_ms"], seg["end_ms"]
             raw_text = res.outputs[0].text if res and res.outputs else ""
             lang, body = parse_qwen3asr(raw_text)
@@ -340,7 +410,7 @@ def main():
         results = merge_by_speaker(results, shots=shots, fps=fps)
         print(f"[transcribe] 按说话人合并: {n_before} → {len(results)} 句")
 
-        out_path = os.path.join(out_dir, f"{vid_name}_raw_segments.json")
+        out_path = os.path.join(out_dir, f"{vh}_raw_segments.json")
         with open(out_path, "w") as f:
             json.dump(results, f, ensure_ascii=False, indent=2)
         print(f"  -> {out_path}")

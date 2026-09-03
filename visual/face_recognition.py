@@ -17,8 +17,7 @@ from collections import defaultdict
 warnings.filterwarnings("ignore")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OUTPUT_DIR = os.path.join(PROJECT_DIR, "output")
-OUT_ROOT = os.environ.get("OUT_ROOT")
+OUT_ROOT = os.environ["OUT_ROOT"]   # 必须由 shikoto 设置，禁止单跑、禁止回退
 EXPECTED_DINO_MODEL_ID = "facebook/dinov3-vitl16-pretrain-lvd1689m"
 
 # project_mode: mode_b, project_name, vid_name
@@ -27,12 +26,8 @@ _project_name = None
 _vid_name = None
 
 def visual_dir(vn):
-    """返回 visual 目录（OUT_ROOT 优先；否则按 Mode A/B 分支）"""
-    if OUT_ROOT:
-        return os.path.join(OUT_ROOT, "visual")
-    if _mode_b:
-        return os.path.join(OUTPUT_DIR, _project_name, "visual")
-    return os.path.join(OUTPUT_DIR, vn, "visual")
+    """返回 visual 目录（产物根 OUT_ROOT）"""
+    return os.path.join(OUT_ROOT, "visual")
 
 def load_video_hash(vid_name, skel_dir):
     """取视频内容指纹 video_hash：vid_name 即内容哈希（batch_pipeline 算好传入，
@@ -46,7 +41,7 @@ def _locate_model(env_names, *candidates):
         v = os.environ.get(n)
         if v and os.path.isdir(v):
             return v
-    hf = os.environ.get("HF_HOME", "/models/hf")
+    hf = os.environ.get("HF_HOME") or sys.exit("[ERR] 未设置 HF_HOME(由 shikoto 注入 $MODELS_ROOT/hf)，禁止单跑用兜底 /models/hf")
     for c in candidates:
         if c.startswith("glob:"):
             m = glob.glob(c[5:].format(hf=hf))
@@ -81,12 +76,8 @@ def _patch_insightface_offline():
         pass
 
 def frames_dir(vn):
-    """帧图目录：统一 <out>/<项目>/shikomi/frames/（2026-08-19 大名定稿新格式）"""
-    if OUT_ROOT:
-        return os.path.join(OUT_ROOT, "shikomi", "frames")
-    if _mode_b:
-        return os.path.join(OUTPUT_DIR, _project_name, "shikomi", "frames")
-    return os.path.join(OUTPUT_DIR, vn, "shikomi", "frames")
+    """帧图目录：统一 <产物根>/shikomi/frames/（2026-08-19 大名定稿新格式）"""
+    return os.path.join(OUT_ROOT, "shikomi", "frames")
 
 def get_suffix(name):
     """返回文件名后缀 _<name>"""
@@ -301,10 +292,7 @@ def detect_faces_global(project_name, force=False):
             sk[k] = v0[k]
     sk["video_id"] = project_name
 
-    if OUT_ROOT:
-        frames_base = os.path.join(OUT_ROOT, "shikomi", "frames")
-    else:
-        frames_base = os.path.join(OUTPUT_DIR, project_name, "shikomi", "frames")
+    frames_base = os.path.join(OUT_ROOT, "shikomi", "frames")
 
     # 解析每 scene frames 标记 → 计算源帧（簇 key + 单帧；黑帧跳过；簇成员共用簇 key 帧）
     source_scenes = defaultdict(list)     # (vh, fn) → [scene_idx...]（0-based 全局下标）

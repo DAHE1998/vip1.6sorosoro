@@ -7,9 +7,9 @@
      audio/dialogue/<hash>_dialogue.json、
      visual/face_head_fusion/<hash>_person_timeline.json（A 逻辑直接产出；B 逻辑缺此文件时
      回退读全局 person_timeline.json，按视频哈希在 dedup 骨架排序序列中定位本集 offset 重映射）
-产物: <out_root>/chapter/<video_hash>_assembled.json
+产物: <out_root>/chapter/<video_hash>_assembled.json（两段式：透传区 + n_scenes/scenes）
      {"video": <hash>, "n_scenes": N, "scenes": [
-        {"scene_id", "shot_range": [s,e], "persons": ["P{n}",...],
+        {"scene_id", "frames_range": [s,e], "persons": ["P{n}",...],
          "frames": ["F1|desc",...], "asr": ["A|text",...]}]}
 
 说明: 读 dedup 骨架 + VLM desc + ASR 台词 + 人物链 → 组装成「组装好的 json」（嵌入骨架，
@@ -27,19 +27,15 @@ BASE = Path(__file__).resolve().parent.parent
 
 
 def resolve_out_root(vh, argv):
-    if os.environ.get("OUT_ROOT"):
-        return os.environ["OUT_ROOT"]
-    if len(argv) >= 3:
-        return argv[2]
-    return str(BASE / "output" / vh)
+    return os.environ["OUT_ROOT"]   # 必须由 shikoto 设置，禁止单跑、禁止回退
 
 
 def load_skeleton(vh, video_out):
     """dedup 骨架（内容哈希前缀）：visual/dedup/<hash>_skeleton.json"""
     p = Path(video_out) / "visual" / "dedup" / f"{vh}_skeleton.json"
     if not p.is_file():
-        cands = glob.glob(str(Path(video_out) / "visual" / "dedup" / f"{vh}_skeleton.json"))
-        cands += glob.glob(str(Path(video_out) / "visual" / "dedup" / f"{vh}_*.json"))
+        cands = list((Path(video_out) / "visual" / "dedup").glob(f"{vh}_skeleton.json"))  # Path.glob：锚点字面，方括号文件夹名不当通配符
+        cands += list((Path(video_out) / "visual" / "dedup").glob(f"{vh}_*.json"))
         if cands:
             p = Path(cands[0])
     if not p.is_file():
@@ -97,7 +93,7 @@ def _load_global_person_map(vh, video_out):
         return {}
     offset = 0
     n_scenes = None
-    for skp in sorted(_glob.glob(str(Path(video_out) / "visual" / "dedup" / "*_skeleton.json"))):
+    for skp in sorted((Path(video_out) / "visual" / "dedup").glob("*_skeleton.json")):
         sk = json.loads(Path(skp).read_text(encoding="utf-8"))
         sk_vh = sk.get("video_hash") or sk.get("video_id")
         cnt = len(sk.get("scenes", []))
@@ -197,17 +193,29 @@ def main():
     person_map = load_person_map(vh, video_out)
 
     embedded = []
+    # 「向前借描述」：已送检帧号按时间升序；无描述帧向前找最近有描述的帧号取描述
+    desc_fns = sorted(vlm_desc.keys())
     for i, sc in enumerate(scenes):
         sid = i  # scene_id = dedup scene 列表序
-        sr = sc.get("shot_range") or {}
+        sr = sc.get("frames_range") or {}
         st, ed = int(sr.get("start", 0)), int(sr.get("end", 0))
         persons = person_map.get(sid, [])
-        # frames：scene 内帧号 → vlm desc，F+序号 与 intro 的「F18=该 scene 第18帧」一致
+        # frames：scene 内帧号 → vlm desc；无描述帧向前借最近有描述帧（2026-08-30 大名：
+        # VLM 5 筛 3 只是去掉语义相近没必要描述的图，落骨架仍是 dedup 后全部代表帧）
         fr_lines = []
-        for fn in sc.get("frames", []):
-            dsc = vlm_desc.get(int(fn))
-            if dsc:
-                fr_lines.append(f"F{len(fr_lines) + 1}|{dsc}")
+        # 黑帧/转场 scene：无画面内容，写特效名（2026-08-30 大名）；不遍历 frames
+        if sc.get("black"):
+            fr_lines.append("F1|黑帧/转场")
+        else:
+            for fn in sc.get("frames", []):
+                fn = int(fn)
+                dsc = vlm_desc.get(fn)
+                if not dsc:
+                    prev = [x for x in desc_fns if x < fn]
+                    if prev:
+                        dsc = vlm_desc.get(prev[-1], "")
+                if dsc:
+                    fr_lines.append(f"F{len(fr_lines) + 1}|{dsc}")
         # asr：scene 级 asr 按落盘序（speaker|text），去空
         asr_lines = []
         for line in shots.get(sid) or []:
@@ -216,7 +224,7 @@ def main():
                 asr_lines.append(line)
         embedded.append({
             "scene_id": sid,
-            "shot_range": [st, ed],
+            "frames_range": [st, ed],
             "persons": [f"P{x}" for x in persons],
             "frames": fr_lines,
             "asr": asr_lines,
@@ -225,8 +233,14 @@ def main():
     out_dir = Path(video_out) / "chapter"
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / f"{vh}_assembled.json"
-    json.dump({"video": vh, "n_scenes": len(scenes), "scenes": embedded},
-              open(out, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    # 两段式（定稿）：① 透传区 = 上游骨架头无脑拷贝，所有下游产物必须带这一大段；
+    # ② 本产物自己的输出段（n_scenes + scenes）
+    HEADER_KEYS = ("video", "video_hash", "video_id", "project_id",
+                   "fps", "width", "height", "total_frames")
+    out_obj = {k: sk[k] for k in HEADER_KEYS if k in sk}
+    out_obj["n_scenes"] = len(scenes)
+    out_obj["scenes"] = embedded
+    json.dump(out_obj, open(out, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
     print(f"[assemble] -> {out} ({len(embedded)} scenes)")
 
 

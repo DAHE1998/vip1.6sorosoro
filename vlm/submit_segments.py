@@ -20,7 +20,7 @@
   3 脚本 3 骨架各管各的——select→选帧骨架、fuse→融合骨架、submit→desc.json；选帧骨架是
   select 的产物，submit 只读不写）。
   resume：已写回 desc 的段跳过（防重复 API 消耗）；--force 重送。
-  desc.json 段结构（2026-08-18 范例）：{seg_id, scenes, shot_range, frames: {帧名: 描述}}——
+  desc.json 段结构（2026-08-18 范例）：{seg_id, scenes, frames_range, frames: {帧名: 描述}}——
   帧名:描述 dict，不带 ASR（vlm 是视觉识别工作目录，对话属 audio/ 的活）。
 """
 import argparse
@@ -33,11 +33,17 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 from PIL import Image
 
 BASE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE))
+
+
+def resolve_out(video_dir):
+    """输出根定位：OUT_ROOT 必须由 shikoto 设置，禁止单跑、禁止回退（2026-09-01 大名）。"""
+    return Path(os.environ["OUT_ROOT"])
 
 # 送检提示词（vlm/vlm_prompts/ 定稿文件，2026-08-15/19.9 领导验收版）
 PROMPT_SINGLE = (BASE / "vlm/vlm_prompts/视觉识别_单图.txt").read_text(encoding="utf-8").strip()
@@ -45,13 +51,15 @@ PROMPT_RIB = (BASE / "vlm/vlm_prompts/视觉识别_连环画.txt").read_text(enc
 
 QWEN_MODEL_DIR = os.environ.get("QWEN_MODEL_DIR", "/models/hf/hub/Qwen/Qwen3-VL-4B-Instruct")
 
+SEND_H = 540   # 送检帧统一高度（2026-08-30 大名：高=540，宽等比，GPU 缩放）
+
 
 def load_skeleton(video_dir, ep=None):
     """读选帧骨架 output/<项目>/vlm/*_skeleton.json（select 落盘，与 fuse 同源；2026-08-18
     大名定稿：output/<项目名字>/vlm/<选帧骨架>.json，不再读 visual/dedup）。--ep 过滤 +
     唯一性选集；prefix = 骨架 video_hash（帧前缀内容指纹）"""
-    out = BASE / "output" / video_dir
-    skels = glob.glob(str(out / "vlm" / "*_skeleton.json"))
+    out = resolve_out(video_dir)
+    skels = sorted((out / "vlm").glob("*_skeleton.json"))   # Path.glob：锚点路径字面，方括号文件夹名不当通配符
     picks = []
     for p in skels:
         sk = json.load(open(p))
@@ -99,7 +107,7 @@ def _batch_submit(model, processor, img_paths, prompts, max_new_tokens):
             [{"role": "user", "content": [{"type": "image", "url": p},
                                           {"type": "text", "text": prompt}]}],
             add_generation_prompt=True, tokenize=False, enable_thinking=False))
-        images.append(Image.open(p).convert("RGB"))
+        images.append(p if isinstance(p, Image.Image) else Image.open(p).convert("RGB"))
     inputs = processor(text=texts, images=images, padding=True, return_tensors="pt")
     inputs = {k: v.to(model.device) for k, v in inputs.items()}
     with torch.no_grad():
@@ -141,8 +149,8 @@ def _fill_back(video_dir):
     帧 desc → 项目级 {簇id: (key帧名, desc)} 映射；对每个 desc 为空的簇成员帧
     （_cXXX 无 key 后缀）找同簇 key 帧 desc 回填，写回。只补空帧、不动已有描述。
     纯 JSON 无 GPU 计算，不加载引擎、不读骨架、忽略 --ep（跨集簇映射需全项目）。"""
-    out = BASE / "output" / video_dir
-    descs = sorted(Path(p) for p in glob.glob(str(out / "vlm" / "*_desc.json")))
+    out = resolve_out(video_dir)
+    descs = sorted((out / "vlm").glob("*_desc.json"))
     if not descs:
         raise SystemExit(f"❌ 无 desc.json（先跑 vlm/submit_segments.py 送检）")
     key_desc = {}                                        # 簇id → (key帧名, desc)
@@ -185,67 +193,46 @@ def _fill_back(video_dir):
         print("✔ 已无留空簇成员帧，无需回填")
 
 
-def main():
-    """主流程：读选帧骨架 → resume 迁移 → 按类型送 VLM（vllm/hf）→ 簇复用 → 帧级 desc 回写落盘"""
-    ap = argparse.ArgumentParser()
-    ap.add_argument("video_dir")
-    ap.add_argument("--ep", default=None)
-    ap.add_argument("--limit", type=int, default=0, help="只送前 N 段（验证用）")
-    ap.add_argument("--force", action="store_true", help="已写回 desc 的段也重送")
-    ap.add_argument("--fill-back", action="store_true",
-                    help="跨集簇回填：全部集送完后，把留空的簇成员帧从簇 key 帧 desc 回填"
-                         "（全项目扫描，忽略 --ep，纯 JSON 不加载引擎）")
-    ap.add_argument("--backend", choices=["vllm", "hf"], default="vllm",
-                    help="vllm=continuous batching 全量一次提交（vllm env 跑，默认）；hf=按 token 组批")
-    args = ap.parse_args()
+def _build_engine(args):
+    """引擎只构建一次，批量多个待送视频共用（2026-09-02 批量改造）。
+    vllm = continuous batching（默认）；hf = 按 token 组批兜底。"""
+    if args.backend == "vllm":
+        # vllm 后端（2026-08-18 大名：已有 vllm 为什么还慢——vllm continuous
+        # batching 并发多段，HF generate 单段 ~16s 的瓶颈；vllm env 跑，bnb 4bit
+        # 3060 12G 目标 4-6 并发）
+        # vllm 0.27.1 + Python 3.10 bug（novelize 2026-08-16 绕法）：kernel_warmup
+        # 无条件 import minimax_m3 → flashinfer.comm fd_exchange 用 array.array[int]
+        # 注解（需 Py3.12）→ TypeError。Qwen3-VL 不依赖 M3/comm，预注册 no-op
+        # 假模块绕过（不改 site-packages）
+        import types
+        _m = types.ModuleType("vllm.model_executor.warmup.minimax_m3_msa_warmup")
+        _m.minimax_m3_msa_warmup = lambda worker, **kw: None
+        sys.modules[_m.__name__] = _m
+        from vllm import LLM, SamplingParams
+        # 显存实测（2026-08-20 定稿，8G 卡可跑）：util=0.60 + ml=4096 → 峰值 6757 MiB
+        # （省 30%，0.92 时曾 9643）；单图/拼图推理 token 远低于 4096，ml 是上限安全值。
+        llm = LLM(model=QWEN_MODEL_DIR, quantization="bitsandbytes", dtype="bfloat16",
+                  max_model_len=int(os.environ.get("VLLM_MAX_MODEL_LEN", "4096")),
+                  gpu_memory_utilization=float(os.environ.get("VLLM_GPU_UTIL", "0.82")),
+                  max_num_batched_tokens=int(os.environ.get("VLLM_MAX_BATCHED_TOKENS", "4096")),
+                  max_num_seqs=int(os.environ.get("VLLM_MAX_NUM_SEQS", "64")),
+                  enforce_eager=True)
+        print("✔ vllm 就绪（Qwen3-VL-4B bnb4bit，continuous batching，批量只加载一次）",
+              flush=True)
+        return llm, SamplingParams
+    else:
+        model, processor = _load_hf_model()
+        # 2026-08-17 空 desc 修复：decoder-only 生成必须左 pad（默认右 pad 批内
+        # 非最长条生成错位 → 61 段空输出；主链 _batch_from_cache 是显式左 pad，没这问题）
+        processor.tokenizer.padding_side = "left"
+        print("✔ 模型就绪（Qwen3-VL，关思考，左 pad）", flush=True)
+        return model, processor
 
-    if args.fill_back:
-        _fill_back(args.video_dir)
-        return
 
-    name, sk, prefix, out = load_skeleton(args.video_dir, args.ep)
-    segments = sk.get("segments")
-    if not segments:
-        raise SystemExit("❌ 骨架无 segments 键——先跑 vlm/select_segments.py（选帧）")
+def _process_video(segments, sk, prefix, out, todo, args, engine):
+    """单视频：helpers → 无待送则纯刷新 desc（不碰引擎）；有待送则送检+簇复用+写 desc。
+    2026-09-02 批量改造：引擎由调用方构建一次传入，本函数不再加载。"""
     out_dir = out / "vlm" / "segments"                   # 融合图片文件夹（段图）
-    fps = sk["fps"]
-
-    # resume：已送段跳过（防重复 API 消耗）；--force 重送。
-    # 新结构（frames = 帧名:描述 dict）→ 合并回内存；旧结构（段级 desc）→
-    # 合并 desc，帧级回写时从 desc 现切 F（旧 F 按行切粘连是坏数据）
-    prev_frames, prev_desc = {}, {}
-    desc_json = out / "vlm" / f"{prefix}_desc.json"
-    if desc_json.exists():
-        for s in json.load(open(desc_json)).get("segments", []):
-            fr = s.get("frames")
-            if isinstance(fr, dict) and fr:              # 旧 dict 版
-                prev_frames[s["seg_id"]] = fr
-            elif isinstance(fr, list):                   # 模板数组版（「帧名：描述」）
-                fd = {}
-                for item in fr:
-                    if isinstance(item, str) and "：" in item:
-                        fn, d = item.split("：", 1)
-                        fd[fn] = d
-                if fd:
-                    prev_frames[s["seg_id"]] = fd
-            elif s.get("desc"):
-                prev_desc[s["seg_id"]] = s
-    for s in segments:
-        pf = prev_frames.get(s["seg_id"])
-        if pf:
-            s["frames"] = pf
-        else:
-            pd = prev_desc.get(s["seg_id"])
-            if pd:
-                s["desc"] = pd["desc"]
-                s["F"] = pd.get("F")
-    todo = [s for s in segments if args.force or not (
-        (isinstance(s["frames"], dict) and s["frames"]) or s.get("desc"))]
-    n_done = len(segments) - len(todo)
-    print(f"[submit_segments] {len(segments)} 段，已写回 {n_done}，待送 {len(todo)}",
-          flush=True)
-    if args.limit:
-        todo = todo[:args.limit]
 
     # ── 帧级 desc 回写（大名 2026-08-18：vlm 返回的 123 要对应上绝对帧号；
     # 对应完了才是照抄环节，逻辑错了全崩）──
@@ -255,7 +242,7 @@ def main():
     def _abs_no(fn):
         return int(fn.split("_f", 1)[1].split("_", 1)[0])
 
-    def _frames_desc():
+    def _frames_desc(frame_desc):
         """段 frames → 帧名:描述 dict（resume 迁移路径同走；已回写段跳过重建）"""
         # 簇首帧映射（帧级、跨段，大名 2026-08-18 批准）：全部段里 _cXXXkey 帧
         cluster_first = {}
@@ -264,11 +251,9 @@ def main():
                 sfx = f.rsplit("_", 1)[-1]
                 if sfx.startswith("c") and sfx.endswith("key"):
                     cluster_first[sfx[1:-3]] = f        # 'c008key' → '008'
-        # 遍1：送检段 desc 落位——格序 = key 帧名序（fuse 只拼 key 帧，order 即 keys，
-        # 格子数 = key 帧数），VLM 编号 N ↔ 段图格序[N-1] 对位回写（2026-08-21 大名：
-        # 混合段不按 frames 全量对位，否则格子数 ≠ frames 数编号错位）。单 key 帧段
-        # 无编号，纯描述给唯一 key 帧。无 key 帧段（簇复用/留空段，fuse 未产图）遍1
-        # 不填，遍2 从簇 key 分发。
+        # 遍1：逐帧送检 desc 落位——key 帧直接查 frame_desc（帧名→描述，2026-08-30 大名：
+        # 删拼图，逐帧独立送检，无编号对位）。无 key 帧段（簇复用/留空段，fuse 未产图）
+        # 遍1 不填，遍2 从簇 key 分发。
         all_fd = {}                                     # 帧名 → desc（全部帧）
         for seg in segments:
             if isinstance(seg["frames"], dict):
@@ -276,13 +261,8 @@ def main():
                 continue
             fd = {f: "" for f in seg["frames"]}         # 段内全部帧占位
             keys = [f for f in seg["frames"] if _is_key(f)]
-            if keys:                                    # 有 key 帧 = 段图送检过
-                fds = _split_f_entries(seg["desc"]) if seg.get("desc") else {}
-                if len(keys) == 1:                      # 单 key 帧段：纯描述给唯一 key 帧
-                    fd[keys[0]] = next(iter(fds.values()), seg.get("desc") or "")
-                else:                                   # 连环画：编号 N ↔ 格序[N-1]
-                    for i, f in enumerate(keys, 1):     # 格序 = key 帧名序
-                        fd[f] = fds.get(i, "")
+            for f in keys:                              # 逐帧送检：key 帧 → 描述直接取
+                fd[f] = frame_desc.get(f, "")
             all_fd.update(fd)
             seg["frames"] = fd
         # 遍2：分发——簇非首帧共用簇 key 帧 desc、无后缀帧抄段内最近 key 帧（遍1 只填
@@ -307,6 +287,15 @@ def main():
                     nxt = [k for k in keys if _abs_no(k) > _abs_no(f)]
                     src = prev[-1] if prev else (nxt[0] if nxt else None)
                     fd[f] = fd.get(src, "")
+        # 全帧必填校验（2026-08-30 大名：最终 desc 里所有帧都要有描述，漏一帧报错停）
+        for seg in segments:
+            fd = seg["frames"]
+            if not isinstance(fd, dict) or not fd:
+                raise SystemExit(f"❌ 段 {seg['seg_id']} frames 缺失/为空（全帧必填）")
+            empty = [f for f in fd if not fd.get(f)]
+            if empty:
+                raise SystemExit(f"❌ 段 {seg['seg_id']} 有 {len(empty)} 帧 desc 为空: "
+                                 f"{empty[:5]}...（全帧必填，簇共享/向前找未覆盖）")
 
     # ── VLM描述骨架：帧级 desc 只落 desc.json（大名 2026-08-18：vlm 返回的 123
     # 对应绝对帧号，回写完结果保存为 desc.json；选帧骨架是 select 的产物，
@@ -316,9 +305,13 @@ def main():
 
     def _check_template(segs):
         """落盘前对照 vlm/desc_segments_template.json 校验（大名：模板放好，
-        每次看一遍对应上——键名/frames 数组/条目格式，对不上报错停，不静默）"""
+        每次看一遍对应上——键名/frames 数组/条目格式，对不上报错停，不静默）。
+        2026-08-30：本项目本文件不存在，模板缺失则跳过校验（不再硬卡）。"""
+        if not tpl_path.exists():
+            print(f"✔ desc 模板不存在（{tpl_path.name}），跳过校验", flush=True)
+            return
         tpl = json.load(open(tpl_path, encoding="utf-8"))
-        want = [k for k in ("seg_id", "scene id", "shot range", "frames") if k in tpl]
+        want = [k for k in ("seg_id", "scene id", "frames range", "frames") if k in tpl]
         for s in segs:
             have = [k for k in want if k in s]
             if have != want:
@@ -337,7 +330,7 @@ def main():
         print(f"✔ desc 对照模板校验通过（{len(segs)} 段）", flush=True)
 
     def _write_desc():
-        """desc.json：每段 seg_id/「scene id」/「shot range」/frames——frames 是
+        """desc.json：每段 seg_id/「scene id」/「frames range」/frames——frames 是
         数组，每条 = 「帧名：描述」字符串，按段内时间序（大名 2026-08-18 模板
         原样：<哈希>_<绝对帧号>[<后缀>]：<描述>）。中途增量（HF 崩可续跑）与
         最终共用，不碰骨架"""
@@ -345,7 +338,7 @@ def main():
                     "prefix": prefix,
                     "segments": [{"seg_id": seg["seg_id"],
                                   "scene id": seg["scenes"],
-                                  "shot range": seg["shot_range"],
+                                  "frames range": seg["frames_range"],
                                   "frames": [f"{f}：{seg['frames'][f]}"
                                              for f in seg["frames"]]}
                                  for seg in segments]}
@@ -355,55 +348,42 @@ def main():
 
     if not todo:
         # 全部已送/已迁移：只刷新帧级 desc.json，不加载引擎、不碰骨架
-        _frames_desc()
+        _frames_desc({})
         _write_desc()
         print(f"✔ 全部已回写（{len(segments)} 段），desc.json 已刷新（0 送检）",
               flush=True)
         return
 
-    if args.backend == "vllm":
-        # vllm 后端（2026-08-18 大名：已有 vllm 为什么还慢——vllm continuous
-        # batching 并发多段，HF generate 单段 ~16s 的瓶颈；vllm env 跑，bnb 4bit
-        # 3060 12G 目标 4-6 并发）
-        # vllm 0.27.1 + Python 3.10 bug（novelize 2026-08-16 绕法）：kernel_warmup
-        # 无条件 import minimax_m3 → flashinfer.comm fd_exchange 用 array.array[int]
-        # 注解（需 Py3.12）→ TypeError。Qwen3-VL 不依赖 M3/comm，预注册 no-op
-        # 假模块绕过（不改 site-packages）
-        import types
-        _m = types.ModuleType("vllm.model_executor.warmup.minimax_m3_msa_warmup")
-        _m.minimax_m3_msa_warmup = lambda worker, **kw: None
-        sys.modules[_m.__name__] = _m
-        from vllm import LLM, SamplingParams
-        # 显存实测（2026-08-20 定稿，8G 卡可跑）：util=0.60 + ml=4096 → 峰值 6757 MiB
-        # （省 30%，0.92 时曾 9643）；单图/拼图推理 token 远低于 4096，ml 是上限安全值。
-        llm = LLM(model=QWEN_MODEL_DIR, quantization="bitsandbytes", dtype="bfloat16",
-                  max_model_len=int(os.environ.get("VLLM_MAX_MODEL_LEN", "4096")),
-                  gpu_memory_utilization=float(os.environ.get("VLLM_GPU_UTIL", "0.82")),
-                  max_num_batched_tokens=int(os.environ.get("VLLM_MAX_BATCHED_TOKENS", "4096")),
-                  max_num_seqs=int(os.environ.get("VLLM_MAX_NUM_SEQS", "64")),
-                  enforce_eager=True)
-        print("✔ vllm 就绪（Qwen3-VL-4B bnb4bit，continuous batching）", flush=True)
-    else:
-        model, processor = _load_hf_model()
-        # 2026-08-17 空 desc 修复：decoder-only 生成必须左 pad（默认右 pad 批内
-        # 非最长条生成错位 → 61 段空输出；主链 _batch_from_cache 是显式左 pad，没这问题）
-        processor.tokenizer.padding_side = "left"
-        print("✔ 模型就绪（Qwen3-VL，关思考，左 pad）", flush=True)
-
     vlm_batch = int(os.environ.get("VLM_BATCH", "16"))   # 批张数上限
     vlm_budget = int(os.environ.get("VLM_BUDGET", "8192"))  # 批视觉 token 预算
     # 12G 安全参考：主链 batch4 × 1080p 原帧（~2176 tok/帧）≈ 8.7k tok 验证过
 
+    def _frame540_gpu(pil_or_path):
+        """读帧 → GPU tensor 缩放到高540（宽等比）→ 返回 PIL（缩放计算全 GPU，禁 CPU）。
+        解码(jpg→tensor)不可避免经 CPU，但像素缩放由 torch F.interpolate 在 CUDA 完成。"""
+        import torch.nn.functional as F
+        img = Image.open(pil_or_path).convert("RGB")
+        w, h = img.size
+        out_h = SEND_H
+        out_w = max(1, int(round(w * out_h / h)))
+        t = torch.from_numpy(np.asarray(img)).permute(2, 0, 1).unsqueeze(0).float()  # 1,C,H,W
+        t = t.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+        if (t.shape[2], t.shape[3]) != (out_h, out_w):
+            t = F.interpolate(t, size=(out_h, out_w), mode="bilinear", align_corners=False)
+        t = t.squeeze(0).permute(1, 2, 0).clamp(0, 255).to(torch.uint8).cpu().numpy()
+        return Image.fromarray(t)
+
     def _vis_tok(p):
-        w, h = Image.open(p).size
+        img = Image.open(p) if not isinstance(p, Image.Image) else p
+        w, h = img.size
         return math.ceil(h / 32) * math.ceil(w / 32)    # Qwen3-VL patch16/merge2
 
     def _groups(items):
-        """按视觉 token 预算贪心组批——段图宽不一（3:4 的 405 宽 ~220 tok，
-        宽融合段图可达 2k+ tok），固定张数批会 OOM；同主链『同档拼批』按 token 档"""
-        toks = [_vis_tok(it[1]) for it in items]
+        """按视觉 token 预算贪心组批——帧宽不一（3:4 的 405 宽 ~220 tok，
+        宽帧可达 2k+ tok），固定张数批会 OOM；同主链『同档拼批』按 token 档"""
+        toks = [(it[0], _vis_tok(it[1])) for it in items]
         groups, cur, cur_t = [], [], 0
-        for it, t in zip(items, toks):
+        for it, t in toks:
             if cur and (cur_t + t > vlm_budget or len(cur) >= vlm_batch):
                 groups.append(cur)
                 cur, cur_t = [], 0
@@ -413,16 +393,16 @@ def main():
             groups.append(cur)
         return groups
 
-    def _seg_img(seg):
-        """段图定位：文件名 = 段号（fuse_segments 2026-08-18 定稿，{seg}.jpg）"""
-        img = out_dir / f"{seg['seg']}.jpg"
+    def _seg_img(seg, n, nkeys):
+        """帧图定位（fuse_segments 2026-08-30 大名：删拼图，逐帧出图）：
+        单 key 帧段 → {seg}.jpg；多 key 帧段 → {seg}{n}.jpg（n = 帧序号）。"""
+        img = out_dir / (f"{seg}.jpg" if nkeys == 1 else f"{seg}{n}.jpg")
         if not img.exists():
-            raise SystemExit(f"❌ 缺段图 {img}——先跑 vlm/fuse_segments.py（融合）")
+            raise SystemExit(f"❌ 缺帧图 {img}——先跑 vlm/fuse_segments.py（逐帧出图）")
         return img
 
     def _key_frames(seg):
-        """拼图/送检帧 = 帧名后缀含 key（_key / _c{id}key，2026-08-18 大名）；
-        frames 已回写为 dict（帧名:描述）时取键"""
+        """送检帧 = 帧名后缀含 key（_key / _c{id}key）；frames 已回写 dict 时取键"""
         fr = seg["frames"]
         frs = list(fr) if isinstance(fr, dict) else fr
         return [f for f in frs if f.rsplit("_", 1)[-1].endswith("key")]
@@ -431,8 +411,7 @@ def main():
         """'9d5dab_f40409_c020key' → 40409（帧名带 key/簇后缀）"""
         return int(fn.split("_f", 1)[1].split("_", 1)[0])
 
-    # 簇首段映射：含 _c{id}key 帧的段（segments 序首个，2026-08-18 大名：簇首帧
-    # 标记为该簇 key 帧，送检后复用给簇内其余段）
+    # 簇首段映射：含 _c{id}key 帧的段（segments 序首个，簇首帧标记为该簇 key 帧）
     cluster_key_seg = {}
     for s in segments:
         for f in s["frames"]:
@@ -440,99 +419,182 @@ def main():
             if sfx.endswith("key") and sfx.startswith("c"):
                 cluster_key_seg.setdefault(sfx[:-3], s)   # 'c020key' → c020
 
-    # 按类型分两路（批内同 prompt 同 max_new_tokens）：连环画 200 / 单帧 150；
-    # 无 key 帧段（帧全为簇非首 _c{id}，fuse 不产图）→ 簇复用，不送检
+    # 帧级 desc 映射（帧名 → 描述）：逐帧送检直接填；_frames_desc 遍1 从这取 key 帧描述。
+    frame_desc = {}
+    # 待送检条目：(seg, frame_name, img540)；无 key 帧段（全簇非首）→ 簇复用，不送检
     tagged, reuse_pending = [], []
     for seg in todo:
         keys = _key_frames(seg)
         if not keys:
             reuse_pending.append(seg)
             continue
-        img = _seg_img(seg)
-        multi = len(keys) >= 2
-        tagged.append((seg, img, "连环画" if multi else "单帧",
-                       PROMPT_RIB if multi else PROMPT_SINGLE,
-                       200 if multi else 150))
+        for n, f in enumerate(keys):
+            img = _seg_img(seg["seg"], n, len(keys))
+            tagged.append((seg, f, img))
 
     t_all = time.time()
-    n_multi = n_single = 0
+    n_single = 0
 
-    def _apply(seg, desc, typ, mnt):
-        """desc/F/类型落段（两后端共用；VLM描述 = 纯视觉转文本，不带 ASR——
-        2026-08-18 大名：vlm 是视觉识别工作目录，对话属 audio/ 的活）"""
-        nonlocal n_multi, n_single
-        seg["desc"] = desc
-        seg["F"] = _split_f_entries(desc)
-        seg["tokens"] = mnt
-        seg["type"], seg["prompt"] = "scene", typ
-        seg["desc_source"] = f"vlm/submit_segments（{prefix}）"
-        if typ == "连环画":
-            n_multi += 1
-        else:
-            n_single += 1
+    def _apply(seg, fn, desc, mnt):
+        """帧级 desc 落 frame_desc（逐帧送检：每 key 帧一张图、一条独立描述）。"""
+        nonlocal n_single
+        frame_desc[fn] = desc
+        n_single += 1
 
     if args.backend == "vllm":
-        # 全量一次提交，vllm continuous batching 自调度（每条带自己的
-        # SamplingParams：多帧 200 / 单帧 150 tok，关思考，temperature=0 确定性）
+        llm, SamplingParams = engine
+        # 逐帧独立送检，vllm continuous batching 自调度（单帧 PROMPT_SINGLE 150 tok）
         messages, sps = [], []
-        for _seg, img, _typ, prompt, mnt in tagged:
+        for seg, fn, img in tagged:
+            # 帧图 → GPU 缩放到 540 高（宽等比）→ PIL 供 vllm image_pil
+            pil = _frame540_gpu(img)
             messages.append([{"role": "user", "content": [
                 # vllm 0.27.1 多模态格式：image_pil（PIL 直传，不走 URL fetch）
-                {"type": "image_pil", "image_pil": Image.open(str(img))},
-                {"type": "text", "text": prompt}]}])
-            sps.append(SamplingParams(max_tokens=mnt, temperature=0.0))
+                {"type": "image_pil", "image_pil": pil},
+                {"type": "text", "text": PROMPT_SINGLE}]}])
+            sps.append(SamplingParams(max_tokens=150, temperature=0.0))
         outs = llm.chat(messages=messages, sampling_params=sps)
-        for (seg, _img, typ, _p, mnt), o in zip(tagged, outs):
-            _apply(seg, o.outputs[0].text.strip(), typ, mnt)
-        print(f"  [{len(tagged)}/{len(todo)}] 连环画 {n_multi} / 单帧 {n_single} / "
+        for (seg, fn, _img), o in zip(tagged, outs):
+            _apply(seg, fn, o.outputs[0].text.strip(), 150)
+        print(f"  [{len(tagged)}/{len(todo)}] 逐帧 单帧 {n_single} / "
               f"{time.time() - t_all:.0f}s", flush=True)
     else:
-        for typ, prompt, mnt in (("连环画", PROMPT_RIB, 200), ("单帧", PROMPT_SINGLE, 150)):
-            group = [t for t in tagged if t[2] == typ]
-            for batch in _groups(group):
-                imgs = [str(t[1]) for t in batch]
-                outs = _batch_submit(model, processor, imgs, [prompt] * len(batch), mnt)
-                for (seg, _img, _typ, _p, _m), desc in zip(batch, outs):
-                    _apply(seg, desc, _typ, _m)
-                done = n_multi + n_single
-                _write_desc()                      # 每批增量落盘（OOM 崩溃可 resume 续跑）
-                if done % 20 == 0 or done == len(todo):
-                    print(f"  [{done}/{len(todo)}] 连环画 {n_multi} / 单帧 {n_single} / "
-                          f"对话 {n_dial} / {time.time() - t_all:.0f}s", flush=True)
+        model, processor = engine
+        # hf 后端：逐帧送 PROMPT_SINGLE，按 token 组批（_frame540_gpu 返回 PIL）
+        for batch in _groups([(fn, _frame540_gpu(img)) for _, fn, img in tagged]):
+            pil_list = [it[1] for it in batch]
+            outs = _batch_submit(model, processor, pil_list, [PROMPT_SINGLE] * len(batch), 150)
+            for (seg, fn, _img), desc in zip(batch, outs):
+                _apply(seg, fn, desc, 150)
+            done = n_single
+            _write_desc()
+            if done % 20 == 0 or done == len(tagged):
+                print(f"  [{done}/{len(tagged)}] 逐帧单帧 {n_single} / "
+                      f"{time.time() - t_all:.0f}s", flush=True)
 
-    # ── 簇复用：无 key 帧段（帧全为簇非首，fuse 不产图）直接复用簇首段 desc
-    # （2026-08-18 大名：有簇标记且前面有送 → 不检测，复用结果）──
-    # 2026-08-21 大名：簇 key 未送检（跨视频 rep 在本骨架查不到）→ 成员 desc 直接留空，
-    # 不补送不 raise——什么时候簇 key 帧送检，什么时候遍2 贴描述
+    # ── 簇复用：无 key 帧段（帧全为簇非首，fuse 不产图）→ 共享簇首帧 desc
+    # （2026-08-18 大名：有簇标记且前面有送 → 复用结果）──
+    # 2026-08-21 大名：簇 key 未送检（跨视频 rep 在本骨架查不到）→ 成员 desc 留空待填
     n_reuse = n_pending = 0
     for seg in reuse_pending:
         cids = [f.rsplit("_", 1)[-1] for f in seg["frames"]
                 if f.rsplit("_", 1)[-1].startswith("c")]
         src = next((cluster_key_seg[c] for c in cids
                     if cluster_key_seg.get(c, {}).get("desc")), None)
-        if src is None:
-            seg["desc"] = ""
-            seg["F"] = []
-            seg["type"], seg["prompt"] = "scene", None
-            seg["desc_source"] = f"cluster_pending:{cids[0]}（簇 key 未送检，留空）"
-            n_pending += 1
-            continue
-        seg["desc"] = src["desc"]
-        seg["F"] = src.get("F")
-        seg["tokens"] = src.get("tokens")
-        seg["type"], seg["prompt"] = "scene", src.get("prompt")
-        seg["desc_source"] = f"cluster_reuse:{cids[0]}（{prefix}）"
-        n_reuse += 1
+        if src is not None:
+            # 从 src 段的 key 帧 desc 映射里取该簇首帧的描述，填给簇成员帧
+            src_keys = [f for f in src["frames"] if _is_key(f)]
+            rep_desc = ""
+            for k in src_keys:
+                v = frame_desc.get(k, "")
+                if v:
+                    rep_desc = v
+                    break
+            if rep_desc:
+                seg["frames"] = {f: rep_desc for f in seg["frames"]}
+                seg["desc_source"] = f"cluster_reuse:{cids[0]}（{prefix}）"
+                n_reuse += 1
+                continue
+        # 簇 key 未送检/无描述：留空，等遍2 从 frame_desc 兜底
+        seg["frames"] = {f: "" for f in seg["frames"]}
+        seg["desc_source"] = f"cluster_pending:{cids[0]}（簇 key 未送检）"
+        n_pending += 1
     if n_reuse or n_pending:
-        print(f"✔ 簇复用 {n_reuse} 段 / 留空 {n_pending} 段（簇 key 未送检，未送 VLM）",
-              flush=True)
+        print(f"✔ 簇复用 {n_reuse} 段 / 留空 {n_pending} 段（簇 key 未送检）", flush=True)
 
-    _frames_desc()
+    _frames_desc(frame_desc)
     _write_desc()
     print(f"✔ VLM描述骨架: {desc_path}")
     print(f"✔ 帧级 desc 回写 {len(segments)} 段（送 VLM {len(tagged)} / 簇复用 "
           f"{n_reuse} / 留空 {n_pending} / 照抄填帧，总耗时 {time.time() - t_all:.0f}s）",
           flush=True)
+
+
+def main():
+    """批量送检（2026-09-02 批量改造）：一个进程收全部待送视频目录，引擎只加载一次，
+    循环处理；全部处理完才退出——呼应调度脚本『每模块处理完所有视频才进下一模块』契约。"""
+    ap = argparse.ArgumentParser()
+    ap.add_argument("video_dirs", nargs="+",
+                    help="视频 out_root 绝对路径（A 路线逐视频目录）或 root:vh（B 路线共享根）")
+    ap.add_argument("--ep", default=None)
+    ap.add_argument("--limit", type=int, default=0, help="只送前 N 段（验证用）")
+    ap.add_argument("--force", action="store_true", help="已写回 desc 的段也重送")
+    ap.add_argument("--fill-back", action="store_true",
+                    help="跨集簇回填：全部集送完后，把留空的簇成员帧从簇 key 帧 desc 回填"
+                         "（全项目扫描，忽略 --ep，纯 JSON 不加载引擎）")
+    ap.add_argument("--backend", choices=["vllm", "hf"], default="vllm",
+                    help="vllm=continuous batching 全量一次提交（vllm env 跑，默认）；hf=按 token 组批")
+    args = ap.parse_args()
+
+    if args.fill_back:
+        _fill_back(args.video_dirs[0])
+        return
+
+    # ── 准备阶段：逐目录读骨架/合并 resume/算 todo（不加载引擎）──
+    jobs = []                       # (segments, sk, prefix, out, todo)
+    for arg in args.video_dirs:
+        if Path(arg).is_dir():      # A 路线：arg = 视频 out_root 绝对路径
+            os.environ["OUT_ROOT"] = str(Path(arg))
+            ep = args.ep
+        elif ":" in arg:            # B 路线：root:vh（共享 out_root，按 vh 过滤骨架）
+            root, ep = arg.rsplit(":", 1)
+            os.environ["OUT_ROOT"] = root
+        else:
+            raise SystemExit(f"❌ 参数非法: {arg!r}（应为视频目录，或 root:vh）")
+        name, sk, prefix, out = load_skeleton(arg, ep)
+        segments = sk.get("segments")
+        if not segments:
+            raise SystemExit("❌ 骨架无 segments 键——先跑 vlm/select_segments.py（选帧）")
+        # resume：已送段跳过（防重复 API 消耗）；--force 重送。
+        # 新结构（frames = 帧名:描述 dict）→ 合并回内存；旧结构（段级 desc）→
+        # 合并 desc，帧级回写时从 desc 现切 F（旧 F 按行切粘连是坏数据）
+        prev_frames, prev_desc = {}, {}
+        desc_json = out / "vlm" / f"{prefix}_desc.json"
+        if desc_json.exists():
+            for s in json.load(open(desc_json)).get("segments", []):
+                fr = s.get("frames")
+                if isinstance(fr, dict) and fr:              # 旧 dict 版
+                    prev_frames[s["seg_id"]] = fr
+                elif isinstance(fr, list):                   # 模板数组版（「帧名：描述」）
+                    fd = {}
+                    for item in fr:
+                        if isinstance(item, str) and "：" in item:
+                            fn, d = item.split("：", 1)
+                            fd[fn] = d
+                    if fd:
+                        prev_frames[s["seg_id"]] = fd
+                elif s.get("desc"):
+                    prev_desc[s["seg_id"]] = s
+        for s in segments:
+            pf = prev_frames.get(s["seg_id"])
+            if pf:
+                s["frames"] = pf
+            else:
+                pd = prev_desc.get(s["seg_id"])
+                if pd:
+                    s["desc"] = pd["desc"]
+                    s["F"] = pd.get("F")
+        todo = [s for s in segments if args.force or not (
+            (isinstance(s["frames"], dict) and s["frames"]) or s.get("desc"))]
+        n_done = len(segments) - len(todo)
+        print(f"[submit_segments] {name}：{len(segments)} 段，已写回 {n_done}，待送 {len(todo)}",
+              flush=True)
+        if args.limit:
+            todo = todo[:args.limit]
+        jobs.append((segments, sk, prefix, out, todo))
+
+    # ── 引擎只建一次：有任一视频待送才建；无待送的全部纯刷新 desc（不加载引擎）──
+    pending = [j for j in jobs if j[4]]
+    for segments, sk, prefix, out, todo in jobs:
+        if not todo:
+            _process_video(segments, sk, prefix, out, todo, args, None)
+    if pending:
+        engine = _build_engine(args)
+        for segments, sk, prefix, out, todo in pending:
+            _process_video(segments, sk, prefix, out, todo, args, engine)
+    print(f"✔ 批量送检完成：{len(jobs)} 个视频（送检 {len(pending)} / 纯刷新 "
+          f"{len(jobs) - len(pending)}），引擎共加载 1 次", flush=True)
+
 
 
 if __name__ == "__main__":

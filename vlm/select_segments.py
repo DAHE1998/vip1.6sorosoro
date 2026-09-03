@@ -24,7 +24,7 @@
 
   数据源（全部直接读上游产物；哈希贯穿全场）：
     ① gc 骨架   visual/global_cos/gc_skeleton.json（每项目全局一份）：scenes 按视频分组、时间
-                序，每 scene = {scene_id(SceneNN 1-based 显示), video_hash, shot_range, black,
+                序，每 scene = {scene_id(SceneNN 1-based 显示), video_hash, frames_range, black,
                 frames: 帧标记}；顶层 cos_matrix = 完整 N×N 全局 cos + cos_frames =
                 [[video_hash, 帧号], ...]（行/列一一对应，非黑 scene 代表帧）。选图结构与 cos
                 的唯一来源（2026-08-21 大名定稿 A）。
@@ -44,21 +44,29 @@
     5. 每 seg 帧 = 保留 scene 代表帧（帧名透传 gc 标记）：无台词 seg ≤5 帧即可；有台词 seg ≤5
        帧 → 提炼 ≤3 帧，保留优先级 有人脸 → 有身体 → 质量好（分数 = 段内平均全局 cos + 人脸
        +1 + 身体 +1，去相似补位）
-    6. 每 seg 独立 shot_range：start = seg 首 scene 的 shot_range.start、end = seg 尾 scene 的
-       shot_range.end（照 gc 骨架 scene shot_range 透传）
+    6. 每 seg 独立 frames_range：start = seg 首 scene 的 frames_range.start、end = seg 尾 scene 的
+       frames_range.end（照 gc 骨架 scene frames_range 透传）
 
   输出契约（3 脚本 3 骨架各管各的，大名 2026-08-18）：select→选帧骨架，落
   output/<项目>/vlm/<hash>_skeleton.json，只带消费方字段：
     - 顶层：video / video_hash / prefix / fps / scenes（fuse 消费：{id, frame} 源帧→scene id）/
       segments
-    - 段字段：seg_id / seg / scenes / shot_range / frames（帧名透传 gc 标记）/ has_asr / t0 / t1
+    - 段字段：seg_id / seg / scenes / frames_range / frames（帧名透传 gc 标记）/ has_asr
+      （2026-09-02 大名：范围一律绝对帧号 frames_range，t0/t1 秒数已删）
 """
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent.parent
+
+
+def resolve_out(video_dir):
+    """输出根定位：OUT_ROOT 必须由 shikoto 设置，禁止单跑、禁止回退（2026-09-01 大名）。"""
+    return Path(os.environ["OUT_ROOT"])
+
 
 # 阈值（现役定稿，锁死不动）
 MAX_SCENES = 5        # 单批 scene 数上限（大名 2026-08-18）
@@ -262,7 +270,7 @@ def main():
     ap.add_argument("--ep", default=None)
     args = ap.parse_args()
 
-    out = BASE / "output" / args.video_dir
+    out = resolve_out(args.video_dir)
     name, gc, vh, scenes, row_of, cm, out = load_gc(out, args.ep)
     vmeta = next(v for v in gc["videos"] if v["video_hash"] == vh)
     fps = vmeta["fps"]
@@ -296,12 +304,10 @@ def main():
             "seg_id": seg_id,
             "seg": f"{vh}_s{seg_id}",       # 段名 = 哈希 + 独立段序号（不绑定 shot id）
             "scenes": [sc["scene_id"] for sc in kept],
-            "shot_range": {"start": kept[0]["shot_range"]["start"],
-                           "end": kept[-1]["shot_range"]["end"]},
+            "frames_range": {"start": kept[0]["frames_range"]["start"],
+                             "end": kept[-1]["frames_range"]["end"]},
             "frames": [_frame_name(sc["frames"][0]) for sc in kept],  # 帧名透传 gc 标记
             "has_asr": has_asr,
-            "t0": round(_frame_no(kept[0]["frames"][0]) / fps, 1),
-            "t1": round(_frame_no(kept[-1]["frames"][0]) / fps, 1),
         })
     print(f"[select] 段: {len(results)}", flush=True)
 

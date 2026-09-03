@@ -29,9 +29,8 @@ OVEREXPOSE_THR = float(os.environ.get("GLOBAL_COS_OVEREXPOSE_THR", "245"))   # y
 def load_all_dedup_skeletons(video_dir):
     """读目录下**所有** dedup scene 骨架（全局：1 个视频也全局、N 个视频也全局）；
     prefix = 骨架 video_hash（内容指纹，改名/重封装不变）"""
-    out = (Path(os.environ["OUT_ROOT"]) if os.environ.get("OUT_ROOT")
-           else BASE / "output" / video_dir)
-    skels = sorted(glob.glob(str(out / "visual/dedup/*_skeleton.json")))
+    out = Path(os.environ["OUT_ROOT"])   # 必须由 shikoto 设置，禁止单跑、禁止回退
+    skels = sorted((out / "visual" / "dedup").glob("*_skeleton.json"))   # Path.glob 锚点字面，路径里的 [ ] 不当通配符（2026-09-02 修方括号文件夹名 bug）
     if not skels:
         raise SystemExit(f"❌ 无 dedup 骨架（先跑 visual/dedup.py）")
     infos = []
@@ -249,7 +248,7 @@ def build_skeleton(infos, cluster_of, reps, thr, cos_matrix, global_frames):
             except Exception:
                 pass  # 解析失败退化为完整 id
             entry = {"scene_id": sid, "video_hash": prefix,
-                     "shot_range": sc.get("shot_range")}
+                     "frames_range": sc.get("frames_range")}
             if sc.get("black"):
                 entry.update({"frames": [], "black": True})
                 scenes.append(entry)

@@ -174,8 +174,25 @@ static MOV g_mov;                      /* S2/S3: 自写 mov 容器（抄 ffmpeg 
 
 /* 解码会话全局状态（单次解码：decoder_session_open/feed/close 专用） */
 static AnnexB  g_ab;
+static HevcAnnexB g_hab;               /* HEVC hvcC→annexb（2026-09-01 多编码） */
+static HakoCodec g_codec = HAKO_CODEC_UNKNOWN;   /* 容器侧编码类型 */
+static unsigned g_cuda_codec = 0;      /* NVDEC cudaVideoCodec_* */
 static uint8_t *g_sam = NULL;          /* hako 样本缓冲（64MB） */
 static int     g_feed_failed = 0;      /* feed_video_once 失败标记 */
+
+/* HakoCodec → cudaVideoCodec_*（3060 NVDEC 硬解集合；MPEG4/ASP 等硬解不支持 → 拒收） */
+static unsigned hako_to_cuda_codec(HakoCodec c) {
+    switch (c) {
+    case HAKO_CODEC_H264:  return cudaVideoCodec_H264;
+    case HAKO_CODEC_HEVC:  return cudaVideoCodec_HEVC;
+    case HAKO_CODEC_AV1:   return cudaVideoCodec_AV1;
+    case HAKO_CODEC_VP9:   return cudaVideoCodec_VP9;
+    case HAKO_CODEC_VP8:   return cudaVideoCodec_VP8;
+    case HAKO_CODEC_MPEG2: return cudaVideoCodec_MPEG2;
+    case HAKO_CODEC_VC1:   return cudaVideoCodec_VC1;
+    default:               return cudaVideoCodec_NumCodecs;   /* 无效值 */
+    }
+}
 
 /* 前向声明：在 blackdetect_eval / display_cb 之前使用 */
 static void black_seg_split(int seg_start, int seg_end);
@@ -1385,9 +1402,15 @@ static void build_cuts(void) {
  * 单次解码会话（三段式接口）
  * ═══════════════════════════════════════════════════════ */
 static void decoder_session_open(void) {
+    /* 0. 编码映射（2026-09-01：NVDEC 全编码，不再 H264 专用） */
+    g_codec = g_mov.v_codec;
+    g_cuda_codec = hako_to_cuda_codec(g_codec);
+    if (g_cuda_codec == cudaVideoCodec_NumCodecs)
+        die("视频编码不在 3060 NVDEC 硬解集合（H264/HEVC/AV1/VP9/VP8/MPEG2/VC1），拒绝处理");
+
     /* 1. 创建 video parser（绑定 sequence/decode/display 回调） */
     CUVIDPARSERPARAMS pp; memset(&pp, 0, sizeof(pp));
-    pp.CodecType = cudaVideoCodec_H264;
+    pp.CodecType = g_cuda_codec;
     pp.ulMaxNumDecodeSurfaces = 20;
     pp.ulMaxDisplayDelay = 4;
     pp.pUserData = NULL;
@@ -1397,10 +1420,16 @@ static void decoder_session_open(void) {
     if (nv.cuvidCreateVideoParser(&g_parser, &pp) != CUDA_SUCCESS)
         die("cuvidCreateVideoParser 失败");
 
-    /* 2. hako 上下文（avcC→annexb） */
+    /* 2. hako 上下文（按编码选 annexb 转换；VP9/AV1 等原始帧直喂，无转换） */
     memset(&g_ab, 0, sizeof(g_ab));
-    if (g_mov.v_extradata_size > 0 && annexb_open(&g_ab, g_mov.v_extradata, g_mov.v_extradata_size) < 0)
-        die("annexb_open（avcC 解析）失败");
+    memset(&g_hab, 0, sizeof(g_hab));
+    if (g_codec == HAKO_CODEC_H264) {
+        if (g_mov.v_extradata_size > 0 && annexb_open(&g_ab, g_mov.v_extradata, g_mov.v_extradata_size) < 0)
+            die("annexb_open（avcC 解析）失败");
+    } else if (g_codec == HAKO_CODEC_HEVC) {
+        if (g_mov.v_extradata_size > 0 && hevc_annexb_open(&g_hab, g_mov.v_extradata, g_mov.v_extradata_size) < 0)
+            die("hevc_annexb_open（hvcC 解析）失败");
+    }
 
     /* 3. 样本缓冲 */
     g_sam = (uint8_t *)xmalloc(64 * 1024 * 1024);
@@ -1418,19 +1447,22 @@ static void feed_video_once(void) {
         if (r == 0) break;            /* EOF */
         if (r < 0) { g_feed_failed = 1; break; }
         uint8_t *out = NULL; int osz = 0;
-        if (annexb_filter(&g_ab, g_sam, (int)n, &out, &osz) < 0) { g_feed_failed = 1; break; }
-        if (out) {
-            CUVIDSOURCEDATAPACKET csp; memset(&csp, 0, sizeof(csp));
-            csp.payload = out;
-            csp.payload_size = (unsigned long)osz;
-            if (nv.cuvidParseVideoData(g_parser, &csp) != CUDA_SUCCESS) {
-                fprintf(stderr, "unified_extract: cuvidParseVideoData 失败\n");
-                g_feed_failed = 1;
-                free(out);
-                break;
-            }
-            free(out);
+        if (g_codec == HAKO_CODEC_H264) {
+            if (annexb_filter(&g_ab, g_sam, (int)n, &out, &osz) < 0) { g_feed_failed = 1; break; }
+        } else if (g_codec == HAKO_CODEC_HEVC) {
+            if (hevc_annexb_filter(&g_hab, g_sam, (int)n, &out, &osz) < 0) { g_feed_failed = 1; break; }
         }
+        /* VP9/AV1/MPEG2/VC1：样本即原始帧/OBU，直喂 NVDEC（out==NULL 走 g_sam 原始字节） */
+        CUVIDSOURCEDATAPACKET csp; memset(&csp, 0, sizeof(csp));
+        csp.payload = out ? out : g_sam;
+        csp.payload_size = (unsigned long)(out ? osz : n);
+        if (nv.cuvidParseVideoData(g_parser, &csp) != CUDA_SUCCESS) {
+            fprintf(stderr, "unified_extract: cuvidParseVideoData 失败\n");
+            g_feed_failed = 1;
+            free(out);
+            break;
+        }
+        free(out);
     }
     if (g_feed_failed) die("feed_video_once 失败");
 }
@@ -1447,6 +1479,7 @@ static void decoder_session_close(void) {
 
     /* 3. hako 收尾 */
     annexb_close(&g_ab);
+    if (g_codec == HAKO_CODEC_HEVC) hevc_annexb_close(&g_hab);
     if (g_sam) { free(g_sam); g_sam = NULL; }
 
     /* 4. 通知并等待 A 线处理线程结束 */

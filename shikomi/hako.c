@@ -27,6 +27,34 @@
 
 /* ---------------- 容器解析（libavformat） ---------------- */
 
+/* 容器编码 → HakoCodec（NVDEC 可硬解集合；其余 UNKNOWN 由 kaiseki 报错拒收） */
+static HakoCodec map_codec_id(int codec_id) {
+    switch (codec_id) {
+    case AV_CODEC_ID_H264:       return HAKO_CODEC_H264;
+    case AV_CODEC_ID_HEVC:       return HAKO_CODEC_HEVC;
+    case AV_CODEC_ID_AV1:        return HAKO_CODEC_AV1;
+    case AV_CODEC_ID_VP9:        return HAKO_CODEC_VP9;
+    case AV_CODEC_ID_VP8:        return HAKO_CODEC_VP8;
+    case AV_CODEC_ID_MPEG2VIDEO: return HAKO_CODEC_MPEG2;
+    case AV_CODEC_ID_VC1:        return HAKO_CODEC_VC1;
+    default:                     return HAKO_CODEC_UNKNOWN;
+    }
+}
+
+/* 3060 NVDEC 硬解支持度优先序（H264 历史现役最稳排最前；UNKNOWN 排最后兜底） */
+static int codec_priority(HakoCodec c) {
+    switch (c) {
+    case HAKO_CODEC_H264:  return 0;
+    case HAKO_CODEC_HEVC:  return 1;
+    case HAKO_CODEC_AV1:   return 2;
+    case HAKO_CODEC_VP9:   return 3;
+    case HAKO_CODEC_VP8:   return 4;
+    case HAKO_CODEC_MPEG2: return 5;
+    case HAKO_CODEC_VC1:   return 6;
+    default:               return 99;
+    }
+}
+
 int mov_open(MOV *m, const char *path) {
     memset(m, 0, sizeof(*m));
     AVFormatContext *fmt = NULL;
@@ -44,14 +72,13 @@ int mov_open(MOV *m, const char *path) {
         return -1;
     }
 
-    int vidx = -1;
+    /* 选轨：全部视频轨里按 NVDEC 硬解优先序取最好的一条（同分取先出现的） */
+    int vidx = -1, vbest = 99;
     for (unsigned i = 0; i < fmt->nb_streams; i++) {
         AVStream *st = fmt->streams[i];
-        if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
-            /* 优先选 H.264（我们解码器固定 cudaVideoCodec_H264） */
-            if (st->codecpar->codec_id == AV_CODEC_ID_H264) { vidx = (int)i; break; }
-            if (vidx < 0) vidx = (int)i;
-        }
+        if (st->codecpar->codec_type != AVMEDIA_TYPE_VIDEO) continue;
+        HakoCodec c = map_codec_id(st->codecpar->codec_id);
+        if (codec_priority(c) < vbest) { vbest = codec_priority(c); vidx = (int)i; }
     }
     if (vidx < 0) {
         fprintf(stderr, "hako: 未找到视频轨: %s\n", path);
@@ -64,6 +91,7 @@ int mov_open(MOV *m, const char *path) {
     m->vst = vst;
     m->vstream_idx = vidx;
     m->has_video = 1;
+    m->v_codec = map_codec_id(vst->codecpar->codec_id);
     m->width  = vst->codecpar->width;
     m->height = vst->codecpar->height;
 
@@ -317,5 +345,131 @@ int annexb_filter(AnnexB *s, const uint8_t *buf_in, int buf_size,
     s->new_idr = new_idr;
     s->idr_sps_seen = sps_seen;
     s->idr_pps_seen = pps_seen;
+    return 0;
+}
+
+/* ---------------- H.265 hvcC → annexb（抄 FFmpeg 9.0 hevc_mp4toannexb） ---------------- */
+
+#define HEVC_NAL_VPS 32
+#define HEVC_NAL_SPS 33
+#define HEVC_NAL_PPS 34
+
+/* hvcC → 参数集 annexb 缓冲（各类型内部多 NAL 以 4 字节 startcode 连接）。
+ * hvcC 布局：22 字节头（含 lengthSizeMinusOne 在第 21 字节低 2 位）+ numOfArrays + 数组。 */
+int hevc_annexb_open(HevcAnnexB *s, const uint8_t *extradata, int extradata_size) {
+    memset(s, 0, sizeof(*s));
+    const uint8_t *p = extradata;
+    if (extradata_size < 23) return -1;
+
+    s->length_size = (p[21] & 0x3) + 1;
+    int num_arrays = p[22];
+    p += 23;
+
+    /* 各类型暂存：同类型多 NAL 用 4 字节 startcode 顺接 */
+    uint8_t *acc[3] = {0, 0, 0};            /* [0]=VPS [1]=SPS [2]=PPS */
+    int acc_n[3] = {0, 0, 0}, acc_cap[3] = {0, 0, 0};
+
+    for (int i = 0; i < num_arrays && p + 3 <= extradata + extradata_size; i++) {
+        int nal_type = p[0] & 0x3f;
+        int num_nalus = (p[1] << 8) | p[2];
+        p += 3;
+        int slot = nal_type == HEVC_NAL_VPS ? 0 : nal_type == HEVC_NAL_SPS ? 1
+                 : nal_type == HEVC_NAL_PPS ? 2 : -1;
+        for (int j = 0; j < num_nalus && p + 2 <= extradata + extradata_size; j++) {
+            int nalu_size = (p[0] << 8) | p[1];
+            p += 2;
+            if (nalu_size > extradata + extradata_size - p) goto oom;
+            if (slot >= 0) {
+                static const uint8_t sc[4] = { 0, 0, 0, 1 };
+                int add = (acc_n[slot] ? 4 : 0) + 4 + nalu_size;
+                if (acc_n[slot] + add > acc_cap[slot]) {
+                    acc_cap[slot] = acc_n[slot] + add + 64;
+                    acc[slot] = realloc(acc[slot], acc_cap[slot]);
+                    if (!acc[slot]) goto oom;
+                }
+                if (acc_n[slot]) { memcpy(acc[slot] + acc_n[slot], sc, 4); acc_n[slot] += 4; }
+                memcpy(acc[slot] + acc_n[slot], sc, 4); acc_n[slot] += 4;
+                memcpy(acc[slot] + acc_n[slot], p, nalu_size); acc_n[slot] += nalu_size;
+            }
+            p += nalu_size;
+        }
+    }
+    s->vps = acc[0]; s->vps_size = acc_n[0];
+    s->sps = acc[1]; s->sps_size = acc_n[1];
+    s->pps = acc[2]; s->pps_size = acc_n[2];
+    s->extradata_parsed = 1;
+    return 0;
+oom:
+    for (int k = 0; k < 3; k++) free(acc[k]);
+    return -1;
+}
+
+void hevc_annexb_close(HevcAnnexB *s) {
+    free(s->vps); free(s->sps); free(s->pps);
+    s->vps = s->sps = s->pps = NULL;
+    s->vps_size = s->sps_size = s->pps_size = 0;
+}
+
+/* length 前缀 NAL → startcode；VCL 帧前缺哪个参数集就补哪个（补过且流内见过即停） */
+int hevc_annexb_filter(HevcAnnexB *s, const uint8_t *buf_in, int buf_size,
+                       uint8_t **out_buf, int *out_size) {
+    if (!s->extradata_parsed) { *out_buf = NULL; *out_size = 0; return 0; }
+
+    /* 第一遍：扫一遍 NAL 类型，更新 seen 标记（VCL 切片出现才算"缺"） */
+    int has_vcl = 0;
+    for (const uint8_t *b = buf_in; b + s->length_size <= buf_in + buf_size; ) {
+        uint32_t nal_size = 0;
+        for (int i = 0; i < s->length_size; i++) nal_size = (nal_size << 8) | b[i];
+        b += s->length_size;
+        if ((int64_t)nal_size > buf_in + buf_size - b) return -1;
+        if (!nal_size) continue;
+        int type = (b[0] >> 1) & 0x3f;
+        if (type == HEVC_NAL_VPS)      s->vps_seen = 1;
+        else if (type == HEVC_NAL_SPS) s->sps_seen = 1;
+        else if (type == HEVC_NAL_PPS) s->pps_seen = 1;
+        else if (type < 32)            has_vcl = 1;
+        b += nal_size;
+    }
+
+    /* 计算输出大小：缺的参数集 + 全部 NAL 的 startcode 版 */
+    uint64_t total = 0;
+    if (has_vcl) {
+        if (!s->vps_seen && s->vps_size) total += s->vps_size;
+        if (!s->sps_seen && s->sps_size) total += s->sps_size;
+        if (!s->pps_seen && s->pps_size) total += s->pps_size;
+    }
+    for (const uint8_t *b = buf_in; b + s->length_size <= buf_in + buf_size; ) {
+        uint32_t nal_size = 0;
+        for (int i = 0; i < s->length_size; i++) nal_size = (nal_size << 8) | b[i];
+        b += s->length_size;
+        if ((int64_t)nal_size > buf_in + buf_size - b) return -1;
+        if (!nal_size) continue;
+        total += 4 + nal_size;
+        b += nal_size;
+    }
+
+    uint8_t *op = malloc(total + AV_INPUT_BUFFER_PADDING_SIZE);
+    if (!op) return -1;
+    uint8_t *w = op;
+    static const uint8_t sc4[4] = { 0, 0, 0, 1 };
+
+    if (has_vcl) {
+        if (!s->vps_seen && s->vps_size) { memcpy(w, s->vps, s->vps_size); w += s->vps_size; s->vps_seen = 1; }
+        if (!s->sps_seen && s->sps_size) { memcpy(w, s->sps, s->sps_size); w += s->sps_size; s->sps_seen = 1; }
+        if (!s->pps_seen && s->pps_size) { memcpy(w, s->pps, s->pps_size); w += s->pps_size; s->pps_seen = 1; }
+    }
+    for (const uint8_t *b = buf_in; b + s->length_size <= buf_in + buf_size; ) {
+        uint32_t nal_size = 0;
+        for (int i = 0; i < s->length_size; i++) nal_size = (nal_size << 8) | b[i];
+        b += s->length_size;
+        if (!nal_size) continue;
+        memcpy(w, sc4, 4); w += 4;
+        memcpy(w, b, nal_size); w += nal_size;
+        b += nal_size;
+    }
+
+    memset(w, 0, AV_INPUT_BUFFER_PADDING_SIZE);
+    *out_buf = op;
+    *out_size = (int)(w - op);
     return 0;
 }

@@ -15,13 +15,8 @@ mode_b = (len(sys.argv) == 4)
 project_name = sys.argv[2] if mode_b else None
 vid_name = sys.argv[3] if mode_b else video_name
 
-OUT_ROOT = os.environ.get("OUT_ROOT")
-if OUT_ROOT:
-    video_dir = OUT_ROOT
-elif mode_b:
-    video_dir = os.path.join(PROJECT_DIR, "output", project_name)
-else:
-    video_dir = os.path.join(PROJECT_DIR, "output", video_name)
+OUT_ROOT = os.environ["OUT_ROOT"]   # 必须由 shikoto 设置，禁止单跑、禁止回退
+video_dir = OUT_ROOT
 vis_dir = os.path.join(video_dir, "visual", "face_detect")
 frames_dir = os.path.join(video_dir, "shikomi", "frames")
 os.makedirs(vis_dir, exist_ok=True)
@@ -49,7 +44,7 @@ def _locate_model(env_names, *candidates):
         v = os.environ.get(n)
         if v and os.path.isdir(v):
             return v
-    hf = os.environ.get("HF_HOME", "/models/hf")
+    hf = os.environ.get("HF_HOME") or sys.exit("[ERR] 未设置 HF_HOME(由 shikoto 注入 $MODELS_ROOT/hf)，禁止单跑用兜底 /models/hf")
     for c in candidates:
         if c.startswith("glob:"):
             m = glob.glob(c[5:].format(hf=hf))

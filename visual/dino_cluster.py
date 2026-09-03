@@ -9,12 +9,13 @@
 产物: Mode A output/<视频名>/visual/dino/（<vhash>_key_frame_embeddings.npz、<vhash>_model_meta.json、<vhash>_skeleton.json）；Mode B 全局 output/<项目>/visual/dino/（key_frame_embeddings.npz 全局矩阵、frame_map.json、model_meta.json、global_similarity_matrix.npy、<vhash>_skeleton.json），并落 visual/dedup/ 骨架与 scene 视觉图
 """
 import json, sys, os, glob
+from pathlib import Path
 import numpy as np
 import torch
 from transformers import AutoModel
 
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OUT_ROOT = os.environ.get("OUT_ROOT")
+OUT_ROOT = os.environ["OUT_ROOT"]   # 必须由 shikoto 设置，禁止单跑、禁止回退
 
 if len(sys.argv) < 2:
     print(f"用法: {sys.argv[0]} <视频名> [<project_name> <vid_name>]")
@@ -130,6 +131,8 @@ def save_per_video(out_dir, vid, shots, meta=None):
         for k in ("video", "video_hash", "fps", "width", "height", "total_frames"):
             if k in meta:
                 sk[k] = meta[k]
+    # project_id：B 路线=项目名，A 路线(project_name 空)=视频名（同 kaiseki 骨架取值）
+    sk["project_id"] = project_name if project_name else vid
     with open(skel_path, "w") as f:
         json.dump(sk, f, ensure_ascii=False, indent=2)
 
@@ -138,13 +141,13 @@ def save_per_video(out_dir, vid, shots, meta=None):
 if mode_b_global:
     # ═══ Mode B: 全局 DINO ═══
     # 收集所有视频的 select_frames
-    sel_dir = os.path.join(OUT_ROOT if OUT_ROOT else os.path.join(PROJECT_DIR, "output", project_name), "shikomi", "select_frames")
-    sel_files = sorted(glob.glob(os.path.join(sel_dir, "*_select_frames.json")))
+    sel_dir = os.path.join(OUT_ROOT, "shikomi", "select_frames")
+    sel_files = sorted(Path(sel_dir).glob("*_select_frames.json"))   # Path.glob：锚点字面，方括号文件夹名不当通配符
     if not sel_files:
         print(f"[04] Mode B 全局: 没有 select_frames in {sel_dir}")
         sys.exit(1)
 
-    out_dir = os.path.join(OUT_ROOT if OUT_ROOT else os.path.join(PROJECT_DIR, "output", project_name), "visual", "dino")
+    out_dir = os.path.join(OUT_ROOT, "visual", "dino")
     os.makedirs(out_dir, exist_ok=True)
 
     # 检查是否已缓存
@@ -158,7 +161,7 @@ if mode_b_global:
     all_kf = []   # [{video_id, local_frame, shot_id}, ...]
     all_video_shots = {}  # vid -> shots[]
     all_video_meta = {}  # vid -> select_frames 元数据（fps/video 透传）
-    frames_base = os.path.join(OUT_ROOT if OUT_ROOT else os.path.join(PROJECT_DIR, "output", project_name), "shikomi", "frames224")
+    frames_base = os.path.join(OUT_ROOT, "shikomi", "frames224")
 
     for sf in sel_files:
         with open(sf) as f:
@@ -312,30 +315,16 @@ if mode_b_global:
             sids = sorted(merged)
             scenes.append({
                 "scene_id": len(scenes),
-                "shot_range": {"start": sids[0], "end": sids[-1]},
+                "frames_range": {"start": vid_shots[sids[0]]["range"]["start"],
+                                 "end": vid_shots[sids[-1]]["range"]["end"]},
                 "shot_frame": {str(sid): ffn[i]},
                 "n_shots": len(sids),
                 "key_frame": ffn[i],
             })
             i = j
 
-        # 边界修正
-        for idx, sc in enumerate(scenes):
-            start, end = sc["shot_range"]["start"], sc["shot_range"]["end"]
-            if idx > 0:
-                prev_end = scenes[idx - 1]["shot_range"]["end"]
-                if start <= prev_end:
-                    start = prev_end + 1
-            if idx < len(scenes) - 1:
-                nxt_start = scenes[idx + 1]["shot_range"]["start"]
-                if end >= nxt_start:
-                    end = nxt_start - 1
-            if end < start:
-                end = start
-            sc["shot_range"]["start"], sc["shot_range"]["end"] = start, end
-            sc["n_shots"] = end - start + 1
-
         # 输出 per-video dedup skeleton
+        # （2026-09-02 大名：frames_range 绝对帧号天然连续不重叠，不再做边界推挤）
         sk_out = {"shots": vid_shots, "scenes": scenes, "video_id": vid}
         out_path = os.path.join(dedup_out, f"{vid}_skeleton.json")
         with open(out_path, "w") as f:
@@ -358,12 +347,12 @@ if mode_b_global:
         scene_emb = np.zeros((len(scenes), kf_emb.shape[1]), dtype=np.float32)
         for i, sc in enumerate(scenes):
             embs = []
-            for sid in range(sc["shot_range"]["start"], sc["shot_range"]["end"] + 1):
-                for s in vid_shots:
-                    if s["id"] == sid:
-                        for fn in s.get("key_frames", []):
-                            if fn in f2idx:
-                                embs.append(kf_emb[f2idx[fn]])
+            fr = sc["frames_range"]
+            for s in vid_shots:
+                if not (s["range"]["end"] < fr["start"] or s["range"]["start"] > fr["end"]):
+                    for fn in s.get("key_frames", []):
+                        if fn in f2idx:
+                            embs.append(kf_emb[f2idx[fn]])
             if embs:
                 scene_emb[i] = np.mean(embs, axis=0)
         scene_emb /= (np.linalg.norm(scene_emb, axis=1, keepdims=True) + 1e-10)
@@ -384,7 +373,7 @@ if mode_b_global:
 else:
     # ═══ Mode A / 单视频文件夹（per-video，输出到 project 目录）═══
     base_dir = project_name if mode_b else video_name
-    out_base = OUT_ROOT if OUT_ROOT else os.path.join(PROJECT_DIR, "output", base_dir)
+    out_base = OUT_ROOT
     vh = load_video_hash(vid_name, os.path.join(out_base, "shikomi", "skeleton"))
     in_path = os.path.join(out_base, "shikomi", "select_frames", f"{vh}_select_frames.json")
     kfs, shots = load_select_frames(in_path)

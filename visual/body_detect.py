@@ -14,8 +14,8 @@ if len(sys.argv) < 2:
     print(f"用法: {sys.argv[0]} <项目名>（每项目全局跑一次，产出 body_bbox.json）"); sys.exit(1)
 project_name = sys.argv[1]
 
-OUT_ROOT = os.environ.get("OUT_ROOT")
-video_dir = Path(OUT_ROOT) if OUT_ROOT else Path(PROJECT_DIR) / "output" / project_name
+OUT_ROOT = os.environ["OUT_ROOT"]   # 必须由 shikoto 设置，禁止单跑、禁止回退
+video_dir = Path(OUT_ROOT)
 frames_dir = video_dir / "shikomi" / "frames"
 out_dir = video_dir / "visual" / "body_detect"
 out_dir.mkdir(parents=True, exist_ok=True)
@@ -53,7 +53,7 @@ print(f"compute frames: {total}（簇 key + 单帧，簇内共享，全项目 {l
 from ultralytics import YOLO
 import cv2
 
-model = YOLO("/models/hf/hub/Ultralytics/YOLOv8/yolov8n.pt")
+model = YOLO(os.path.join(os.environ.get("MODELS_ROOT", str(Path(__file__).resolve().parent.parent.parent / "models")), "yolo/yolov8n.pt"))
 
 def detect_one(vh, fn):
     p = frames_dir / f"{vh}_f{fn}.jpg"

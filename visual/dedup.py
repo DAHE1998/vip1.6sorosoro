@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """visual/dedup.py — 视觉 scene 骨架：单视频内去重，形成 scene。
 相邻 key_frame cos≥0.75 合并，段内有脸帧优先选代表，跨 shot 去重组 = scene；
-保留原始 shot 编号（scene.shot_range 用原始号区间，含被吞的 shot）；
+保留原始 shot 编号（scene.frames_range 用覆盖 shot 的绝对帧区间）；
 下游（人脸识别 / onion / graph_merge）以 dedup scene 为原子，scene_range 用原始号；
 ASR 注入不在 dedup 做（由 chapter 步骤 assemble.py 负责）。
 
@@ -28,13 +28,8 @@ mode_b = (len(sys.argv) == 4)
 project_name = sys.argv[2] if mode_b else None
 vid_name = sys.argv[3] if mode_b else video_name
 
-OUT_ROOT = os.environ.get("OUT_ROOT")
-if OUT_ROOT:
-    video_dir = OUT_ROOT
-elif mode_b:
-    video_dir = os.path.join("output", project_name)
-else:
-    video_dir = os.path.join("output", video_name)
+OUT_ROOT = os.environ["OUT_ROOT"]   # 必须由 shikoto 设置，禁止单跑、禁止回退
+video_dir = OUT_ROOT
 visual_dir = os.path.join(video_dir, "visual")
 dino_dir = os.path.join(visual_dir, "dino")
 out_dir = os.path.join(visual_dir, "dedup")
@@ -159,7 +154,7 @@ while True:
                 and (ffn[fj] in black_frames) == (ffn[fj + 1] in black_frames):
             fj += 1      # 只在 shot 内部去重（2026-08-18 大名：去重后的 shot 变成 scene，
                          # 不跨 shot 合并——否则代表帧的 scene_shots 吞进邻 shot 的 id，
-                         # scene.shot_range 就跨多 shot 了）；黑帧帧不与非黑帧帧合并
+                         # scene.frames_range 就跨多 shot 了）；黑帧帧不与非黑帧帧合并
         if fj - fi >= 1:
             cand = list(range(fi, fj + 1))
             face_c = [k for k in cand if str(ffn[k]) in fm and fm[str(ffn[k])]]
@@ -214,7 +209,7 @@ for ws, we in black_runs:
     bfn = sorted(f for f in black_frames if ws <= f <= we)
     black_scenes.append({
         "id": len(black_scenes),
-        "shot_range": {"start": min(bshots), "end": max(bshots)},
+        "frames_range": {"start": ws, "end": we},   # 黑帧段精确帧区间 = 绝对帧号
         "shot_frame": {},
         "frames": [f for f in bfn if f in ffn],      # 黑帧段存活帧（可能空）
         "n_shots": len(bshots),
@@ -243,7 +238,9 @@ while i < n:
     sids = sorted(merged)
     scenes.append({
         "id": len(scenes),
-        "shot_range": {"start": sids[0], "end": sids[-1]},
+        # frames_range = 覆盖 shot 的绝对帧区间 [首 shot.start, 尾 shot.end]
+        "frames_range": {"start": shots[sids[0]]["range"]["start"],
+                         "end": shots[sids[-1]]["range"]["end"]},
         "shot_frame": {str(sid): ffn[i]},
         "frames": ffn[i:j],                          # scene 内全部存活帧（保留帧全集，展示用）
         "n_shots": len(sids),
@@ -252,17 +249,17 @@ while i < n:
     i = j
 
 # ③ 黑帧 scene 按时间序归位：黑帧按 frame_range 起点，普通按实际首帧 frames[0]。
-# 普通 scene 的 shot_range 可能覆盖黑帧段（shot 粒度，帧被切到黑帧段后仍指向原 shot），
+# 普通 scene 的 frames_range 可能覆盖黑帧段（shot 粒度，帧被切到黑帧段后仍指向原 shot），
 # 作排序键会把黑帧段后的 scene 排到黑帧 scene 前，黑帧隔断失效（2026-08-17 大名）。
 scenes = scenes + black_scenes
 scenes.sort(key=lambda sc: (sc.get("frame_range") or sc["frames"])[0])
 n_black = sum(1 for sc in scenes if sc.get("black"))
 print(f"[dedup] 黑帧帧 {len(black_frames)} / 黑帧段 {len(black_runs)} / 黑帧 scene {n_black}")
 
-# scene.shot_range 用原始 shot 归属（sids[0]/sids[-1]，即 scene 存活帧的 shot id 集合）。
-# 2026-08-05 曾有后处理把 shot_range 推挤成「连续无重叠区间」，末位 scene 空间被挤光时
-# 造出越界 shot id（如只有 0..194 却出现 195），下游 shots[id] 索引 KeyError。
-# 2026-08-18 大名：只能在 shot 内部去重、不可破坏 shot → 回归原始归属，不做任何推挤。
+# scene.frames_range 用覆盖 shot 的绝对帧区间（首 shot.range.start .. 尾 shot.range.end）。
+# 2026-09-02 大名定稿：范围一律绝对帧号，禁 shot id（2026-08-05 曾有后处理把范围推挤成
+# 「连续无重叠区间」，末位 scene 空间被挤光时造出越界 id，下游索引 KeyError——
+# 绝对帧号天然连续不重叠，不再推挤）。
 sk["scenes"] = scenes
 
 # scene×scene 视觉图（graph_merge 消费）：每 scene 用其 key_frame 向量，取 sim 子矩阵；

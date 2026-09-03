@@ -19,6 +19,7 @@ from srt_to_segments import find_srt, parse_srt
 
 LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+OUT_ROOT = os.environ["OUT_ROOT"]   # 必须由 shikoto 设置，禁止单跑、禁止回退
 
 def overlap(a0, a1, b0, b1):
     """两段时间区间重叠长度（ms）。"""
@@ -31,26 +32,16 @@ def frame_to_ms(frame, fps):
 def main():
     """按首字帧号把台词落进 shot/scene，写 dialogue.json 与 dialogue_text.txt。"""
     if len(sys.argv) < 2:
-        print(f"用法: {sys.argv[0]} <vn> [<project> <vid_name>]"); sys.exit(1)
+        print(f"用法: {sys.argv[0]} <vh>"); sys.exit(1)
 
-    vn = sys.argv[1]
-    mode_b = (len(sys.argv) == 4)
-    project_name = sys.argv[2] if mode_b else None
-    vid_name = sys.argv[3] if mode_b else vn
-    sfx = f"_{vid_name}"
+    vh = sys.argv[1]   # 命名铁律: 产物一律 <vh>_*, 只认哈希, 禁止标题
 
-    # 2026-08-14 修复：batch_pipeline 以 OUT_ROOT 调用，子脚本需与其布局一致（见 asr_pipeline.py）
-    OUT_ROOT = os.environ.get("OUT_ROOT")
-    if OUT_ROOT:
-        base_dir = OUT_ROOT
-    elif mode_b:
-        base_dir = os.path.join(PROJECT_DIR, "output", project_name)
-    else:
-        base_dir = os.path.join(PROJECT_DIR, "output", vn)
+    # 产物根一律 OUT_ROOT（shikoto 设置），禁止单跑、禁止回退
+    base_dir = OUT_ROOT
 
     # 读 dedup 骨架（2026-08-19 大名：每个视频的终点就到 dedup；ASR 输出物按哈希
     # 命名对齐，video_hash 透传 dedup。graph_merge/onion 已废弃不进）
-    skel_path = os.path.join(base_dir, "visual", "dedup", f"{vid_name}_skeleton.json")
+    skel_path = os.path.join(base_dir, "visual", "dedup", f"{vh}_skeleton.json")
     if not os.path.isfile(skel_path):
         print(f"[merge] 找不到 dedup 骨架: {skel_path}（先跑视觉流水线至 dedup）")
         sys.exit(1)
@@ -66,7 +57,7 @@ def main():
     if srt_path:
         raw_segments = parse_srt(srt_path)
         # 说话人对齐: 句子起点落在哪个 pyannote 段就用哪个说话人（跨段取起点段）
-        spk_path = os.path.join(base_dir, "audio", "speaker", f"{vid_name}_speakers.json")
+        spk_path = os.path.join(base_dir, "audio", "speaker", f"{vh}_speakers.json")
         if os.path.isfile(spk_path):
             spk_segs = json.load(open(spk_path))
             for seg in raw_segments:
@@ -81,8 +72,13 @@ def main():
         else:
             print(f"[merge] srt 直读: {os.path.basename(srt_path)} ({len(raw_segments)} 段, 无 speakers.json 说话人未知)")
     else:
-        raw_path = os.path.join(base_dir, "audio", "transcribe", f"{vid_name}_raw_segments.json")
-        raw_segments = [r for r in json.load(open(raw_path)) if r["text"].strip()]
+        raw_path = os.path.join(base_dir, "audio", "transcribe", f"{vh}_raw_segments.json")
+        # 无 ASR 产物（无音轨/静音/未跑）→ 空 dialogue，正常跳过，不视为异常
+        if not os.path.isfile(raw_path):
+            print(f"[merge] 警告: 无转录产物 {raw_path} → 写空 dialogue（无对白）", flush=True)
+            raw_segments = []
+        else:
+            raw_segments = [r for r in json.load(open(raw_path)) if r["text"].strip()]
     print(f"[merge] {len(shots)} shots, {len(raw_segments)} segments")
 
     # 重复段压缩连续 ≥3 条相同文本 → 合并为 1 条）
@@ -171,15 +167,15 @@ def main():
                 all_text_lines.append(f"{lt}{sent['speaker']}: {sent['text']}")
 
     # ASR 自己的骨架（2026-08-19 大名范例）：scene 级聚合台词，透传视频信息+哈希。
-    # 每 scene：scene_id（= dedup scene 列表序，0-based，全链路统一）+ shot_range
-    #（shot 编号范围，0-based，对应 <哈希>_shot_id）+ asr（['说话人|台词', ...]，
-    # 说话人=声纹字母，按 shot 序 + 台词 start_ms 先后排）。台词按 scene 覆盖的 shot 聚合。
+    # 每 scene：scene_id（= dedup scene 列表序，0-based，全链路统一）+ frames_range
+    #（绝对帧号范围 [fstart, fend]，0-based）+ asr（['说话人|台词', ...]，
+    # 说话人=声纹字母，按 shot 序 + 台词 start_ms 先后排）。台词按 scene 覆盖的帧区间聚合。
     # 台词归属：每句按首字帧号唯一落一个 scene（2026-08-19 大名：句级台词只属一个
-    # scene，绝不横跨）。黑帧 scene 与相邻正常 scene 共享 shot_range（黑帧段把同 shot
+    # scene，绝不横跨）。黑帧 scene 与相邻正常 scene 共享 frames_range（黑帧段把同 shot
     # 拆开）——不能按「scene 覆盖的 shot 拉台词」（会一句重复进两个 scene），必须按
     # 台词首字帧号落在本 scene 的帧范围内才归属。
-    # 2026-08-19 大名修正：scene = shot 范围，shot = 帧范围，联合 = 本 scene 覆盖的
-    # 帧区间 [fstart, fend]，区间内任意帧号都对应本 scene。不可用 scene 的稀疏代表帧
+    # 2026-09-02 大名定稿：frames_range 直接携带 scene 覆盖的绝对帧区间
+    # [fstart, fend]，区间内任意帧号都对应本 scene。不可用 scene 的稀疏代表帧
     # frames（每 scene 仅 2 帧）当范围——否则 268 句只落进 5 句（bug 根因）。
     # 2026-08-19 大名定稿：黑帧的 ASR 向后归纳（黑帧 scene 自身 asr 空，其区间内台词
     # 归其后第一个正常 scene；最后的黑帧无后 scene，无法归纳）。
@@ -188,12 +184,10 @@ def main():
     # 改为直接遍历全部台词按 fn0 落 scene 帧区间。
     fps = skeleton["fps"]
     scenes = skeleton.get("scenes", [])
-    shot_frames = {s["id"]: (s["range"]["start"], s["range"]["end"]) for s in shots}
     spans = []
     for sc in scenes:
-        rng = sc["shot_range"]
-        fr = shot_frames.get(rng["start"]), shot_frames.get(rng["end"])
-        spans.append((fr[0][0], fr[1][1]) if all(fr) else None)
+        rng = sc.get("frames_range")
+        spans.append((rng["start"], rng["end"]) if rng else None)
     fwd_target = [None] * len(scenes)      # 黑帧 scene → 其后第一个正常 scene
     nxt = None
     for i in range(len(scenes) - 1, -1, -1):
@@ -216,17 +210,17 @@ def main():
             buckets[tgt].append(line)
     asr_scenes = []
     for idx, sc in enumerate(scenes):
-        asr_scenes.append({"scene_id": idx, "shot_range": sc["shot_range"], "asr": buckets[idx]})
+        asr_scenes.append({"scene_id": idx, "frames_range": sc["frames_range"], "asr": buckets[idx]})
     out_sk = {"video": skeleton.get("video"), "video_id": skeleton.get("video_id"),
               "video_hash": skeleton.get("video_hash"), "fps": fps,
               "width": skeleton.get("width"), "height": skeleton.get("height"),
               "total_frames": skeleton.get("total_frames"), "scenes": asr_scenes}
     out_sk = {k: v for k, v in out_sk.items() if v is not None}
 
-    dia_skel_path = os.path.join(dia_dir, f"{vid_name}_dialogue.json")
+    dia_skel_path = os.path.join(dia_dir, f"{vh}_dialogue.json")
     with open(dia_skel_path, "w", encoding="utf-8") as f:
         json.dump(out_sk, f, ensure_ascii=False, indent=2)
-    txt_path = os.path.join(dia_dir, f"{vid_name}_dialogue_text.txt")
+    txt_path = os.path.join(dia_dir, f"{vh}_dialogue_text.txt")
     with open(txt_path, "w", encoding="utf-8") as f:
         f.write("\n".join(all_text_lines) + "\n")
 

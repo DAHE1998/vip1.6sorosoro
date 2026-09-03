@@ -6,32 +6,23 @@
 产物: —（纯模块，不落盘）
 
 职责: SRT 字幕的查找与解析，供 merge_speaker 嵌入 shot 时直读。
-  find_srt(video_path, video_hash) → 三级查找字幕路径:
-      1. 视频同名 .srt（<视频路径去扩展名>.srt）
-      2. 项目 input/subtitles/<video_hash>.srt（哈希索引，防改名）
-      3. 遍历 input/ 目录树找 .srt
-         同名可能对不上 → 递归找，视频同名优先，无同名取第一个）
+  find_srt(video_path, video_hash) → 字幕查找:
+      1. 视频同路径同名 .srt/.ass
+      2. 视频同目录内同名（.srt/.ass，防扩展名不同）
   parse_srt(path) → [{id, start_ms, end_ms, text, lang, speaker}]
       说话人默认 -1，由 merge_speaker 按声纹段时间对齐填充
 """
 import os, re
 
-PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
 def find_srt(video_path, video_hash=""):
-    """字幕查找:
-    1.视频同名 .srt/.ass  2.input/subtitles/<video_hash>.srt  3.视频同目录内同名。找不到返回 None。"""
+    """字幕查找: 1.视频同路径同名 .srt/.ass  2.视频同目录内同名。找不到返回 None。"""
     base = os.path.splitext(video_path)[0]
     for ext in (".srt", ".ass"):
         cand = base + ext
         if os.path.isfile(cand):
             return cand
-    if video_hash:
-        cand2 = os.path.join(PROJECT_DIR, "input", "subtitles", f"{video_hash}.srt")
-        if os.path.isfile(cand2):
-            return cand2
     # 同目录内找同名（WebDL 每集一目录，srt 与视频同目录但可能为 .ass）
-    # 2026-08-13 重装修复：原实现 os.walk(input/) 无同名取第一个 → japan girl 错用 vivant EP02 字幕
+    # 2026-08-13 重装修复：原实现目录树乱抓第一个 → japan girl 错用 vivant EP02 字幕
     video_dir = os.path.dirname(video_path)
     video_base = os.path.splitext(os.path.basename(video_path))[0]
     if os.path.isdir(video_dir):

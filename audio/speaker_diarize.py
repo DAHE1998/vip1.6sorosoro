@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """audio/speaker_diarize.py — pyannote speaker-diarization-3.1 全片说话人分割。
 
-用法: python3 audio/speaker_diarize.py <vn>
-依赖: output/<vn>/audio/wav/audio.wav（extract_audio 产物）
-产物: output/<vn>/audio/speaker/speakers.json（[{id,start_ms,end_ms,speaker}]）
+用法: python3 audio/speaker_diarize.py <vh>
+依赖: OUT_ROOT/audio/wav/<vh>_audio.wav（tool_audio_extract 产物）
+产物: OUT_ROOT/audio/speaker/<vh>_speakers.json（[{id,start_ms,end_ms,speaker}]）
+命名铁律: 产物一律 <vh>_*（哈希），禁视频标题。
 """
 import json, os, sys, time
 from pyannote.audio import Pipeline
@@ -15,7 +16,7 @@ def _locate_model(env_names, *candidates):
         v = os.environ.get(n)
         if v and os.path.isdir(v):
             return v
-    hf = os.environ.get("HF_HOME", "/models/hf")
+    hf = os.environ.get("HF_HOME") or sys.exit("[ERR] 未设置 HF_HOME(由 shikoto 注入 $MODELS_ROOT/hf)，禁止单跑用兜底 /models/hf")
     for c in candidates:
         if c.startswith("glob:"):
             m = glob.glob(c[5:].format(hf=hf))
@@ -32,31 +33,29 @@ def _locate_model(env_names, *candidates):
 MODEL_PATH = _locate_model(("PYANNOTE_MODEL_DIR",),
                         "glob:{hf}/hub/models--pyannote--speaker-diarization-3.1/snapshots/*")
 PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+OUT_ROOT = os.environ["OUT_ROOT"]   # 必须由 shikoto 设置，禁止单跑、禁止回退
 
 def main():
     """读 wav → pyannote 说话人分割 → 输出每说话人片段 {id,start_ms,end_ms,speaker}。"""
     if len(sys.argv) < 2:
-        print(f"用法: {sys.argv[0]} <vn> [<project> <vid_name>]"); sys.exit(1)
+        print(f"用法: {sys.argv[0]} <vh>"); sys.exit(1)
 
-    vn = sys.argv[1]
-    mode_b = (len(sys.argv) == 4)
-    project_name = sys.argv[2] if mode_b else None
-    vid_name = sys.argv[3] if mode_b else vn
-    sfx = f"_{vid_name}"
+    vh = sys.argv[1]   # 命名铁律: 产物一律 <vh>_*, 只认哈希, 禁止标题
 
-    # 2026-08-14 修复：batch_pipeline 以 OUT_ROOT 调用，asr_pipeline 已支持，
-    # 子脚本缺失导致路径错位（wav 在 out_root/audio/wav/ 却读 output/<vn>/）→ 统一优先 OUT_ROOT
-    OUT_ROOT = os.environ.get("OUT_ROOT")
-    if OUT_ROOT:
-        base_dir = OUT_ROOT
-    elif mode_b:
-        base_dir = os.path.join(PROJECT_DIR, "output", project_name)
-    else:
-        base_dir = os.path.join(PROJECT_DIR, "output", vn)
+    # 产物根一律 OUT_ROOT（shikoto 设置），禁止单跑、禁止回退
+    base_dir = OUT_ROOT
 
-    wav_path = os.path.join(base_dir, "audio", "wav", f"{vid_name}_audio.wav")
+    wav_path = os.path.join(base_dir, "audio", "wav", f"{vh}_audio.wav")
     out_dir  = os.path.join(base_dir, "audio", "speaker")
     os.makedirs(out_dir, exist_ok=True)
+
+    # 无音轨/静音视频：wav 缺失（抽音轨失败或无音频流）→ 写空 speakers.json 占位，
+    # 下游 transcribe 读空 segment 得空结果，属正常跳过，不视为异常（2026-09-01 大名）。
+    if not os.path.isfile(wav_path):
+        print(f"[diarize] 警告: 无音轨/未抽成 wav: {wav_path} → 写空 speakers.json（无毒）")
+        with open(os.path.join(out_dir, f"{vh}_speakers.json"), "w") as f:
+            json.dump([], f, ensure_ascii=False)
+        return
 
     print(f"[diarize] loading pyannote speaker-diarization-3.1 (local)...")
     # 2026-08-13 重装修复：
@@ -64,7 +63,7 @@ def main():
     #     → config 注入本地占位 plda（AgglomerativeClustering 推理不碰 plda，加载仅需文件存在）
     #   - dict config 走本地分支，零联网
     import yaml
-    plda_local = os.environ.get("PLDA_MODEL_DIR", "/models/hf/plda_local")
+    plda_local = os.environ.get("PLDA_MODEL_DIR") or sys.exit("[ERR] 未设置 PLDA_MODEL_DIR(由 shikoto 注入 $MODELS_ROOT/plda_local)，禁止单跑用兜底 /models/hf/plda_local")
     with open(os.path.join(MODEL_PATH, "config.yaml")) as fp:
         cfg = yaml.safe_load(fp)
     cfg.setdefault("pipeline", {}).setdefault("params", {})["plda"] = plda_local
@@ -105,7 +104,7 @@ def main():
             "speaker":  label_to_int[speaker],
         })
 
-    out_path = os.path.join(out_dir, f"{vid_name}_speakers.json")
+    out_path = os.path.join(out_dir, f"{vh}_speakers.json")
     with open(out_path, "w") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
 
